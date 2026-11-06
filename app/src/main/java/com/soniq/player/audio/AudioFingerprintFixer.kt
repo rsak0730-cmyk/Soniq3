@@ -5,12 +5,9 @@ import android.media.MediaMetadataRetriever
 import android.net.Uri
 import com.soniq.player.data.MatchUtils
 import com.soniq.player.data.Song
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.async
-import kotlinx.coroutines.awaitAll
-import kotlinx.coroutines.coroutineScope
-import kotlinx.coroutines.sync.Semaphore
-import kotlinx.coroutines.sync.withPermit
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import java.io.File
@@ -19,6 +16,7 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
 import java.util.concurrent.atomic.AtomicInteger
+import java.security.MessageDigest
 import kotlin.math.abs
 
 data class FingerprintResult(
@@ -43,8 +41,8 @@ object AudioFingerprintFixer {
 
     /** A catalog match is only applied when its title, artist and length all agree. */
     private const val MATCH_THRESHOLD = 0.62
-    private const val MIN_TITLE_SIM = 0.72
-    private const val MIN_ARTIST_SIM = 0.40
+    private const val MIN_TITLE_SIM = 0.78
+    private const val MIN_ARTIST_SIM = 0.50
     private const val MAX_DURATION_DIFF_MS = 3000L
     private const val MAX_DURATION_DIFF_NO_ARTIST_MS = 2500L
     /** Without an artist tag the title must still agree closely (about 3 of 4 words). */
@@ -55,6 +53,10 @@ object AudioFingerprintFixer {
     @Volatile var lastRunNetworkFailures: Int = 0
         private set
     private val networkFailures = AtomicInteger(0)
+    private val requestGate = Any()
+    @Volatile private var lastCatalogRequestAt = 0L
+    private const val CATALOG_CACHE_TTL_MS = 7L * 24L * 60L * 60L * 1000L
+    private const val MIN_CATALOG_REQUEST_GAP_MS = 1200L
     @Volatile private var firstFailure: String? = null
     /** First network or catalog error seen in the last batch run, shown in the summary. */
     @Volatile var lastRunFirstError: String? = null
@@ -106,12 +108,12 @@ object AudioFingerprintFixer {
     suspend fun autoFixSong(context: Context, song: Song): FingerprintResult = withContext(Dispatchers.IO) {
         val embedded = readEmbedded(context, song)
 
-        // 1. The file's own tags, when they are clean. Artwork comes from the embedded picture,
-        //    or from the catalog if the file has no picture.
+        // 1. Clean embedded tags are retained as metadata, but are not acoustic fingerprint
+        //    verification. Do not launch a second catalog search just to fetch artwork: that
+        //    doubled traffic and was a major contributor to iTunes HTTP 429 responses.
         val tags = embedded.tags
         if (tags != null) {
-            val art = embedded.picture?.let { saveArtBytes(context, song.id, it) }
-                ?: findCatalogArt(tags.title, tags.artist, song.durationMs)?.let { saveArtUrl(context, song.id, it) }
+            val art = embedded.picture?.let { saveArtBytes(context, song.id, it) } ?: song.albumArtUri
             return@withContext FingerprintResult(
                 title = tags.title,
                 artist = tags.artist,
@@ -128,12 +130,10 @@ object AudioFingerprintFixer {
 
         var bestCandidate: CatalogCandidate? = null
         var bestScore = 0.0
-        // JioSaavn's two previously configured public deployments are currently
-        // unavailable (DNS NXDOMAIN / paused deployment). Do not waste a request
-        // on them or count their known outages as failures; use the reachable
-        // iTunes India catalog as the active source.
-        for (query in buildQueries(localTitle, localArtist)) {
-            val candidates = queryItunes(query)
+        // Use at most two carefully constructed searches per track. Requests are globally
+        // serialized, rate-limited and cached on disk to avoid HTTP 429 on large libraries.
+        for (query in buildQueries(localTitle, localArtist).take(2)) {
+            val candidates = queryItunes(context, query)
             for (c in candidates) {
                 val score = scoreCandidate(c, localTitle, localArtist, song.durationMs) ?: continue
                 if (score > bestScore) {
@@ -181,14 +181,10 @@ object AudioFingerprintFixer {
     private fun buildQueries(localTitle: String, localArtist: String): List<String> {
         val queries = LinkedHashSet<String>()
         if (localArtist.isNotBlank()) queries.add("$localTitle $localArtist")
-        // Without "Official / Video / Full" the catalog finds the song far more often.
+        // A second query removes common download/video noise while preserving the title.
         val core = localTitle.split(" ").filter { it.isNotBlank() && it.lowercase() !in SEARCH_NOISE }.joinToString(" ")
         if (core.length >= 3) queries.add(core)
-        queries.add(localTitle)
-        val words = localTitle.split(" ").filter { it.isNotBlank() }
-        if (words.size >= 3) queries.add(words.take(3).joinToString(" "))
-        if (words.size >= 2) queries.add(words.take(2).joinToString(" "))
-        return queries.filter { it.length >= 3 }.take(5)
+        return queries.filter { it.length >= 3 }.take(2)
     }
 
     /** Returns a 0..1 score when the candidate agrees with the file, or null when it does not. */
@@ -208,17 +204,6 @@ object AudioFingerprintFixer {
         }
         val durScore = if (hasDur) 1.0 - diff.toDouble() / MAX_DURATION_DIFF_MS else 0.5
         return 0.55 * titleSim + 0.25 * artistSim + 0.20 * durScore
-    }
-
-    private fun findCatalogArt(title: String, artist: String, durationMs: Long): String? {
-        val cleanTitle = cleanLocalTitle(title)
-        if (cleanTitle.length < 3) return null
-        val query = "$cleanTitle ${cleanLocalTitle(artist)}".trim()
-        val candidates = queryItunes(query)
-        return candidates
-            .filter { scoreCandidate(it, cleanTitle, cleanLocalTitle(artist), durationMs) != null }
-            .firstOrNull { !it.artUrl.isNullOrBlank() }
-            ?.artUrl
     }
 
     private fun readEmbedded(context: Context, song: Song): EmbeddedRead {
@@ -250,10 +235,50 @@ object AudioFingerprintFixer {
         }
     }
 
-    private fun queryItunes(query: String): List<CatalogCandidate> {
+    /**
+     * iTunes catalog access is intentionally serialized. The endpoint returned HTTP 429
+     * during real-device batch runs; parallel requests and repeated per-song queries made
+     * that much worse. Successful and empty responses are cached for seven days.
+     */
+    private suspend fun queryItunes(context: Context, query: String): List<CatalogCandidate> {
+        val cacheFile = catalogCacheFile(context, query)
+        readCatalogCache(cacheFile)?.let { return it }
+
+        var lastError: String? = null
+        for (attempt in 0..3) {
+            val response = withContext(Dispatchers.IO) {
+                synchronized(requestGate) {
+                    val waitMs = MIN_CATALOG_REQUEST_GAP_MS - (System.currentTimeMillis() - lastCatalogRequestAt)
+                    if (waitMs > 0) Thread.sleep(waitMs)
+                    lastCatalogRequestAt = System.currentTimeMillis()
+                    requestItunes(query)
+                }
+            }
+            if (response.candidates != null) {
+                writeCatalogCache(cacheFile, response.candidates)
+                return response.candidates
+            }
+            lastError = response.error
+            if (response.retryAfterMs == null || attempt == 3) break
+            // Exponential backoff with a server Retry-After floor, capped at 30 seconds.
+            val backoff = (1000L shl attempt).coerceAtMost(8000L)
+            delay(maxOf(backoff, response.retryAfterMs).coerceAtMost(30_000L))
+        }
+        noteFailure(lastError ?: "Unknown iTunes catalog error")
+        return emptyList()
+    }
+
+    private data class ItunesResponse(
+        val candidates: List<CatalogCandidate>?,
+        val error: String? = null,
+        val retryAfterMs: Long? = null
+    )
+
+    private fun requestItunes(query: String): ItunesResponse {
+        var conn: HttpURLConnection? = null
         return try {
             val encoded = URLEncoder.encode(query, "UTF-8")
-            val conn = (URL("https://itunes.apple.com/search?term=$encoded&entity=song&limit=25&country=IN")
+            conn = (URL("https://itunes.apple.com/search?term=$encoded&entity=song&limit=25&country=IN")
                 .openConnection() as HttpURLConnection).apply {
                 connectTimeout = 8000
                 readTimeout = 10000
@@ -262,16 +287,17 @@ object AudioFingerprintFixer {
                 setRequestProperty("Accept", "application/json")
             }
             val code = conn.responseCode
-            if (code != 200) {
-                noteFailure("HTTP $code from iTunes")
-                conn.disconnect()
-                return emptyList()
+            if (code == 429) {
+                val retry = conn.getHeaderField("Retry-After")?.toLongOrNull()?.times(1000L)
+                return ItunesResponse(null, "HTTP 429 from iTunes", retry ?: 3000L)
             }
-            val text = conn.inputStream.bufferedReader().use { it.readText() }
-            conn.disconnect()
-            val results = JSONObject(text).optJSONArray("results") ?: return emptyList()
-            (0 until results.length()).mapNotNull { i ->
-                val item = results.getJSONObject(i)
+            if (code in 500..599) return ItunesResponse(null, "HTTP $code from iTunes", 1500L)
+            if (code != 200) return ItunesResponse(null, "HTTP $code from iTunes")
+
+            val body = conn.inputStream.bufferedReader().use { it.readText() }
+            val results = JSONObject(body).optJSONArray("results") ?: return ItunesResponse(emptyList())
+            val parsed = (0 until results.length()).mapNotNull { i ->
+                val item = results.optJSONObject(i) ?: return@mapNotNull null
                 val title = item.optString("trackName", "").trim()
                 if (title.isBlank()) return@mapNotNull null
                 CatalogCandidate(
@@ -282,9 +308,47 @@ object AudioFingerprintFixer {
                     artUrl = item.optString("artworkUrl100", "").replace("100x100bb", "600x600bb").ifBlank { null }
                 )
             }
+            ItunesResponse(parsed)
         } catch (e: Exception) {
-            noteFailure("${e.javaClass.simpleName} from iTunes: ${e.message}")
-            emptyList()
+            ItunesResponse(null, "${e.javaClass.simpleName} from iTunes: ${e.message}")
+        } finally {
+            conn?.disconnect()
+        }
+    }
+
+    private fun catalogCacheFile(context: Context, query: String): File {
+        val key = MessageDigest.getInstance("SHA-256").digest(query.trim().lowercase().toByteArray())
+            .joinToString("") { "%02x".format(it) }
+        return File(File(context.filesDir, "catalog_cache").apply { mkdirs() }, "$key.json")
+    }
+
+    private fun readCatalogCache(file: File): List<CatalogCandidate>? = runCatching {
+        if (!file.exists() || System.currentTimeMillis() - file.lastModified() > CATALOG_CACHE_TTL_MS) return null
+        val array = JSONObject(file.readText()).optJSONArray("results") ?: return null
+        (0 until array.length()).mapNotNull { i ->
+            val item = array.optJSONObject(i) ?: return@mapNotNull null
+            CatalogCandidate(
+                title = item.optString("title"), artist = item.optString("artist"),
+                album = item.optString("album"), durationMs = item.optLong("durationMs"),
+                artUrl = item.optString("artUrl").ifBlank { null }
+            )
+        }
+    }.getOrNull()
+
+    private fun writeCatalogCache(file: File, candidates: List<CatalogCandidate>) {
+        runCatching {
+            val array = org.json.JSONArray()
+            candidates.forEach { c ->
+                array.put(JSONObject().put("title", c.title).put("artist", c.artist)
+                    .put("album", c.album).put("durationMs", c.durationMs)
+                    .put("artUrl", c.artUrl ?: ""))
+            }
+            val temp = File(file.parentFile, file.name + ".tmp")
+            temp.writeText(JSONObject().put("results", array).toString())
+            if (!temp.renameTo(file)) {
+                file.writeText(temp.readText())
+                temp.delete()
+            }
         }
     }
 
@@ -345,32 +409,31 @@ object AudioFingerprintFixer {
         if (total == 0) return@withContext 0
         networkFailures.set(0)
         firstFailure = null
+        lastRunNetworkFailures = 0
+        lastRunFirstError = null
 
         val fixedCount = AtomicInteger(0)
         val done = AtomicInteger(0)
-        val semaphore = Semaphore(3)
-
-        coroutineScope {
-            songs.map { song ->
-                async {
-                    semaphore.withPermit {
-                        try {
-                            val result = autoFixSong(context, song)
-                            // Only a verified match counts. The cleaned-title fallback (0.55) is not a fix.
-                            if (result.matchConfidence >= 0.60f) {
-                                withContext(Dispatchers.Main) { onSongFixed(song, result) }
-                                fixedCount.incrementAndGet()
-                            } else {
-                                withContext(Dispatchers.Main) { onSongUnmatched(song) }
-                            }
-                        } catch (e: Exception) {
-                            e.printStackTrace()
-                        }
-                        val current = done.incrementAndGet()
-                        withContext(Dispatchers.Main) { onProgress(current, total, song.title) }
-                    }
+        // Process one song at a time. This is slower than parallel fan-out but avoids
+        // overwhelming public catalog APIs and keeps a large library scan predictable.
+        for (song in songs) {
+            try {
+                val result = autoFixSong(context, song)
+                // Only a catalog-verified result counts. A cleaned filename is not a match.
+                if (result.matchConfidence >= 0.60f) {
+                    withContext(Dispatchers.Main) { onSongFixed(song, result) }
+                    fixedCount.incrementAndGet()
+                } else {
+                    withContext(Dispatchers.Main) { onSongUnmatched(song) }
                 }
-            }.awaitAll()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                noteFailure("${e.javaClass.simpleName}: ${e.message}")
+                withContext(Dispatchers.Main) { onSongUnmatched(song) }
+            }
+            val current = done.incrementAndGet()
+            withContext(Dispatchers.Main) { onProgress(current, total, song.title) }
         }
         lastRunNetworkFailures = networkFailures.get()
         lastRunFirstError = firstFailure

@@ -1190,7 +1190,7 @@ fun TagEditorAndFingerprintDialog(
                     Text(if (isFingerprinting) "Analyzing Catalog Match..." else "Magic Audio Fingerprint Fix")
                 }
                 if (matchConfidence > 0f) {
-                    Text("• Confidence Match: ${(matchConfidence * 100).toInt()}% • Verified", color = ElectricCyan, fontSize = 12.sp)
+                    Text("• Metadata match confidence: ${(matchConfidence * 100).toInt()}%", color = ElectricCyan, fontSize = 12.sp)
                 }
             }
         },
@@ -1944,6 +1944,29 @@ fun SoniqApp() {
                             album = fix.album,
                             albumArtUri = artUri
                         )
+
+                        // Keep Android's lock-screen / notification MediaSession metadata in
+                        // sync when Auto-Fix corrects the track that is already playing.
+                        val activeController = controller
+                        val activeIndex = activeController?.currentMediaItemIndex ?: -1
+                        val activeItem = activeController?.currentMediaItem
+                        if (activeController != null && activeIndex >= 0 && activeItem?.mediaId == song.id.toString()) {
+                            val savedPosition = activeController.currentPosition.coerceAtLeast(0L)
+                            val wasPlaying = activeController.isPlaying
+                            val updatedItem = activeItem.buildUpon()
+                                .setMediaMetadata(
+                                    MediaMetadata.Builder()
+                                        .setTitle(fix.title)
+                                        .setArtist(fix.artist)
+                                        .setAlbumTitle(fix.album)
+                                        .setArtworkUri(artUri?.let(Uri::parse))
+                                        .build()
+                                )
+                                .build()
+                            activeController.replaceMediaItem(activeIndex, updatedItem)
+                            activeController.seekTo(activeIndex, savedPosition)
+                            if (wasPlaying) activeController.play()
+                        }
                     }
                 },
                 onSongUnmatched = { song ->

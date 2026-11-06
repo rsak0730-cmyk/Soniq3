@@ -50,8 +50,8 @@ object LyricsEngine {
     private const val CACHE_DIR = "lyrics_cache"
     private const val MISS_RETRY_MS = 3L * 24 * 60 * 60 * 1000
     private const val MAX_LINE_MS = 9000L
-    private const val MIN_TITLE_SIM = 0.72
-    private const val MIN_ARTIST_SIM = 0.45
+    private const val MIN_TITLE_SIM = 0.78
+    private const val MIN_ARTIST_SIM = 0.55
     // Reject alternate edits/remasters whose timing can drift from the local audio.
     private const val MAX_DURATION_DIFF_SEC = 2.0
 
@@ -317,7 +317,10 @@ object LyricsEngine {
      * supplied genuine per-word timestamps; line-level LRC is never subdivided by guesswork.
      */
     private fun finalizeLines(raw: List<LyricLine>, durationMs: Long): List<LyricLine> {
-        val sorted = raw.sortedBy { it.timestampMs }
+        val valid = raw.filter { line ->
+            line.timestampMs >= 0L && (durationMs <= 0L || line.timestampMs < durationMs)
+        }
+        val sorted = valid.sortedBy { it.timestampMs }
         val out = ArrayList<LyricLine>(sorted.size)
         for (i in sorted.indices) {
             val line = sorted[i]
@@ -366,7 +369,7 @@ object LyricsEngine {
         if (!file.exists()) return null
         return runCatching {
             val obj = JSONObject(file.readText())
-            if (obj.optInt("wordTimingVersion", 0) != 3) return null
+            if (obj.optInt("wordTimingVersion", 0) != 4) return null
             if (obj.optBoolean("miss", false)) {
                 val fresh = System.currentTimeMillis() - obj.optLong("ts") < MISS_RETRY_MS
                 return if (fresh) LyricsResult.NONE else null
@@ -401,7 +404,7 @@ object LyricsEngine {
     private fun writeCache(context: Context, key: String, result: LyricsResult?) {
         runCatching {
             val dir = File(context.filesDir, CACHE_DIR).apply { mkdirs() }
-            val obj = JSONObject().put("ts", System.currentTimeMillis()).put("wordTimingVersion", 3)
+            val obj = JSONObject().put("ts", System.currentTimeMillis()).put("wordTimingVersion", 4)
             if (result == null || result.lines.isEmpty()) {
                 obj.put("miss", true)
             } else {

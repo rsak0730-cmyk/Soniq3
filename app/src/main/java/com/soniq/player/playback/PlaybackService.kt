@@ -31,6 +31,7 @@ class PlaybackService : MediaSessionService() {
     private var audioManager: AudioManager? = null
     private var focusRequest: AudioFocusRequest? = null
     private var isDucked = false
+    private var resumeAfterFocusGain = false
 
     private val listener = object : Player.Listener {
         override fun onAudioSessionIdChanged(audioSessionId: Int) {
@@ -49,10 +50,19 @@ class PlaybackService : MediaSessionService() {
             // A track that cannot be opened would otherwise leave the player stuck, so the
             // next button stops working. Drop that item from the queue and continue.
             val p = session?.player ?: return
-            if (p.hasNextMediaItem()) {
-                p.removeMediaItem(p.currentMediaItemIndex)
-                p.prepare()
-                p.play()
+            when {
+                p.hasNextMediaItem() -> {
+                    p.removeMediaItem(p.currentMediaItemIndex)
+                    p.prepare()
+                    p.play()
+                }
+                p.mediaItemCount > 1 -> {
+                    // Recover when the failed item is the final queue entry as well.
+                    p.seekToDefaultPosition(0)
+                    p.prepare()
+                    p.play()
+                }
+                else -> p.pause()
             }
         }
     }
@@ -92,12 +102,17 @@ class PlaybackService : MediaSessionService() {
                         fadeVolume(player, player.volume, 1.0f, 600L)
                         isDucked = false
                     }
-                    if (!player.isPlaying && player.playbackState == Player.STATE_READY) {
+                    if (resumeAfterFocusGain && player.playbackState != Player.STATE_IDLE) {
                         player.play()
                     }
+                    resumeAfterFocusGain = false
                 }
-                AudioManager.AUDIOFOCUS_LOSS_TRANSIENT,
+                AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> {
+                    resumeAfterFocusGain = player.isPlaying
+                    if (player.isPlaying) player.pause()
+                }
                 AudioManager.AUDIOFOCUS_LOSS -> {
+                    resumeAfterFocusGain = false
                     if (player.isPlaying) player.pause()
                 }
             }

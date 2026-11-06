@@ -52,7 +52,8 @@ object LyricsEngine {
     private const val MAX_LINE_MS = 9000L
     private const val MIN_TITLE_SIM = 0.72
     private const val MIN_ARTIST_SIM = 0.45
-    private const val MAX_DURATION_DIFF_SEC = 3.0
+    // Reject alternate edits/remasters whose timing can drift from the local audio.
+    private const val MAX_DURATION_DIFF_SEC = 2.0
 
     private val LRC_TIME = Regex("""\[(\d{1,3}):(\d{2})(?:[.:](\d{1,3}))?]""")
     private val WORD_TAG = Regex("""<(\d{1,3}):(\d{2})(?:[.:](\d{1,3}))?>""")
@@ -158,15 +159,17 @@ object LyricsEngine {
             val durDiff = if (hasDur) abs(durSec - c.durationSec) else 0.0
             if (hasDur && durDiff > MAX_DURATION_DIFF_SEC) continue
             if (artist.isBlank() && !hasDur) continue // never match an unknown artist on title alone
-            val durScore = if (hasDur) 1.0 - durDiff / MAX_DURATION_DIFF_SEC else 0.5
-
+            // Identity and recording length must dominate language preference. The old
+            // weights let almost any synced Hindi result outrank a closer recording,
+            // which is a common cause of lyrics running ahead/behind the audio.
+            val durScore = if (hasDur) 1.0 - (durDiff / MAX_DURATION_DIFF_SEC) else 0.0
             val synced = !c.synced.isNullOrBlank()
             val langRank = if (detectLanguage(body) != "English/Other") 1.0 else 0.0
-            val score = 0.35 * titleSim +
-                0.25 * artistSim +
-                0.15 * durScore +
-                (if (synced) 0.6 else 0.0) +   // timed lyrics always beat untimed ones
-                0.25 * langRank                // then Hindi/Hinglish beats other languages
+            val score = 0.38 * titleSim +
+                0.32 * artistSim +
+                0.25 * durScore +
+                (if (synced) 0.04 else 0.0) +
+                0.01 * langRank
 
             if (best == null || score > best.second) best = c to score
         }
@@ -286,7 +289,11 @@ object LyricsEngine {
             if (plain.isNotEmpty()) plain.append(' ')
             plain.append(segment)
         }
-        return if (words.isEmpty()) null else plain.toString() to words
+        if (words.isEmpty()) return null
+        // Reject malformed/non-monotonic word tags. Keeping line-sync is safer than
+        // animating words from corrupt or inconsistent timestamps.
+        if (words.zipWithNext().any { (a, b) -> b.startMs <= a.startMs || b.startMs < a.endMs }) return null
+        return plain.toString() to words
     }
 
     private fun tagMs(m: MatchResult): Long {
@@ -359,7 +366,7 @@ object LyricsEngine {
         if (!file.exists()) return null
         return runCatching {
             val obj = JSONObject(file.readText())
-            if (obj.optInt("wordTimingVersion", 0) != 2) return null
+            if (obj.optInt("wordTimingVersion", 0) != 3) return null
             if (obj.optBoolean("miss", false)) {
                 val fresh = System.currentTimeMillis() - obj.optLong("ts") < MISS_RETRY_MS
                 return if (fresh) LyricsResult.NONE else null
@@ -394,7 +401,7 @@ object LyricsEngine {
     private fun writeCache(context: Context, key: String, result: LyricsResult?) {
         runCatching {
             val dir = File(context.filesDir, CACHE_DIR).apply { mkdirs() }
-            val obj = JSONObject().put("ts", System.currentTimeMillis()).put("wordTimingVersion", 2)
+            val obj = JSONObject().put("ts", System.currentTimeMillis()).put("wordTimingVersion", 3)
             if (result == null || result.lines.isEmpty()) {
                 obj.put("miss", true)
             } else {

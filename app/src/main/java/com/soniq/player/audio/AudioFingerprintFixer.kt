@@ -128,8 +128,12 @@ object AudioFingerprintFixer {
 
         var bestCandidate: CatalogCandidate? = null
         var bestScore = 0.0
+        // JioSaavn's two previously configured public deployments are currently
+        // unavailable (DNS NXDOMAIN / paused deployment). Do not waste a request
+        // on them or count their known outages as failures; use the reachable
+        // iTunes India catalog as the active source.
         for (query in buildQueries(localTitle, localArtist)) {
-            val candidates = queryJioSaavn(query) + queryItunes(query)
+            val candidates = queryItunes(query)
             for (c in candidates) {
                 val score = scoreCandidate(c, localTitle, localArtist, song.durationMs) ?: continue
                 if (score > bestScore) {
@@ -210,7 +214,7 @@ object AudioFingerprintFixer {
         val cleanTitle = cleanLocalTitle(title)
         if (cleanTitle.length < 3) return null
         val query = "$cleanTitle ${cleanLocalTitle(artist)}".trim()
-        val candidates = queryJioSaavn(query) + queryItunes(query)
+        val candidates = queryItunes(query)
         return candidates
             .filter { scoreCandidate(it, cleanTitle, cleanLocalTitle(artist), durationMs) != null }
             .firstOrNull { !it.artUrl.isNullOrBlank() }
@@ -246,74 +250,13 @@ object AudioFingerprintFixer {
         }
     }
 
-    private fun queryJioSaavn(query: String): List<CatalogCandidate> {
-        val endpoints = listOf(
-            "https://saavn.dev/api/search/songs",
-            "https://jiosaavn-api-privatecvc2.vercel.app/search/songs"
-        )
-        val out = ArrayList<CatalogCandidate>()
-        for (baseUrl in endpoints) {
-            try {
-                val encoded = URLEncoder.encode(query, "UTF-8")
-                val conn = (URL("$baseUrl?query=$encoded&limit=6").openConnection() as HttpURLConnection).apply {
-                    connectTimeout = 4000
-                    readTimeout = 4000
-                    instanceFollowRedirects = true
-                    setRequestProperty("User-Agent", USER_AGENT)
-                    setRequestProperty("Accept", "application/json")
-                }
-                val code = conn.responseCode
-                if (code != 200) {
-                    noteFailure("HTTP $code from $baseUrl")
-                    conn.disconnect()
-                    continue
-                }
-                val text = conn.inputStream.bufferedReader().use { it.readText() }
-                conn.disconnect()
-                val results = JSONObject(text).optJSONObject("data")?.optJSONArray("results") ?: continue
-                for (i in 0 until results.length()) {
-                    val item = results.getJSONObject(i)
-                    val title = item.optString("name", "")
-                        .replace("&quot;", "\"").replace("&#039;", "'").replace("&amp;", "&").trim()
-                    if (title.isBlank()) continue
-
-                    val primary = item.optJSONObject("artists")?.optJSONArray("primary")
-                    val artist = if (primary != null && primary.length() > 0) {
-                        (0 until primary.length()).joinToString(", ") { primary.getJSONObject(it).optString("name", "") }
-                            .trim(' ', ',')
-                    } else {
-                        item.optString("primaryArtists", "")
-                    }
-
-                    val images = item.optJSONArray("image")
-                    val artUrl = if (images != null && images.length() > 0) {
-                        val last = images.getJSONObject(images.length() - 1)
-                        last.optString("url", "").ifBlank { last.optString("link", "") }.ifBlank { null }
-                    } else null
-
-                    out += CatalogCandidate(
-                        title = title,
-                        artist = artist,
-                        album = item.optJSONObject("album")?.optString("name", "")?.ifBlank { "Single" } ?: "Single",
-                        durationMs = item.optLong("duration", 0L) * 1000L,
-                        artUrl = artUrl
-                    )
-                }
-            } catch (e: Exception) {
-                noteFailure("${e.javaClass.simpleName} from $baseUrl: ${e.message}")
-                continue
-            }
-        }
-        return out
-    }
-
     private fun queryItunes(query: String): List<CatalogCandidate> {
         return try {
             val encoded = URLEncoder.encode(query, "UTF-8")
-            val conn = (URL("https://itunes.apple.com/search?term=$encoded&entity=song&limit=8&country=IN")
+            val conn = (URL("https://itunes.apple.com/search?term=$encoded&entity=song&limit=25&country=IN")
                 .openConnection() as HttpURLConnection).apply {
-                connectTimeout = 4000
-                readTimeout = 4000
+                connectTimeout = 8000
+                readTimeout = 10000
                 instanceFollowRedirects = true
                 setRequestProperty("User-Agent", USER_AGENT)
                 setRequestProperty("Accept", "application/json")

@@ -1966,9 +1966,11 @@ fun SoniqApp() {
             isBatchFixing = false
             val failed = AudioFingerprintFixer.lastRunNetworkFailures
             val skipped = targets.size - count
+            val firstError = AudioFingerprintFixer.lastRunFirstError
             batchSummary = "Auto-fix complete: updated $count of ${targets.size} songs" +
                 (if (skipped > 0) ", $skipped had no verified match" else "") + "." +
-                (if (failed > 0) " $failed catalog requests failed. Check the internet connection and run it again." else "")
+                (if (failed > 0) " $failed iTunes catalog requests failed" +
+                    (firstError?.let { " (first error: $it)" } ?: ".") else "")
         }
     }
 

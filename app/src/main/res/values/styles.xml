@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.Soniq" parent="@android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:statusBarColor">#C9DCD4</item>
+        <item name="android:navigationBarColor">#C9DCD4</item>
+        <item name="android:windowBackground">#C9DCD4</item>
+        <item name="android:windowLightStatusBar">true</item>
+        <item name="android:windowLightNavigationBar">true</item>
+    </style>
+</resources>

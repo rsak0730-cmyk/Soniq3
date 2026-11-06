@@ -1062,7 +1062,7 @@ fun LiveSyncedKaraokeLyrics(
                     .then(if (canSeek) Modifier.clickable { onSeek(line.timestampMs) } else Modifier),
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
-                if (!isActive || line.words.isEmpty()) {
+                if (!isActive || !line.wordSynced || line.words.isEmpty()) {
                     Text(
                         text = line.text,
                         color = if (isActive) NeoInk else NeoMuted.copy(alpha = 0.6f),
@@ -1072,8 +1072,10 @@ fun LiveSyncedKaraokeLyrics(
                         modifier = Modifier.fillMaxWidth()
                     )
                 } else {
-                    // The word being sung is the last word whose start time has passed.
-                    val currentWord = line.words.indexOfLast { positionMs >= it.startMs }
+                    // Word highlight uses only timestamps supplied by the lyric source.
+                    val currentWord = line.words.indexOfLast {
+                        positionMs >= it.startMs && positionMs < it.endMs
+                    }
                     FlowRow(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.Center,

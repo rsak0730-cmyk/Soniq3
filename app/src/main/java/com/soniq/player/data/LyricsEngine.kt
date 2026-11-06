@@ -23,7 +23,9 @@ data class LyricLine(
     val text: String,
     val words: List<TimedWord> = emptyList(),
     /** When this line stops being the active line (exclusive). */
-    val endMs: Long = Long.MAX_VALUE
+    val endMs: Long = Long.MAX_VALUE,
+    /** True only when the source supplied an actual timestamp for each word. */
+    val wordSynced: Boolean = false
 )
 
 data class LyricsResult(
@@ -251,27 +253,38 @@ object LyricsEngine {
                 val enhanced = if (WORD_TAG.containsMatchIn(body)) parseEnhancedWords(body) else null
                 val plainText = enhanced?.first ?: body.trim()
                 val words = enhanced?.second ?: emptyList()
-                if (plainText.isNotBlank()) out += LyricLine(start, plainText, words)
+                if (plainText.isNotBlank()) {
+                    out += LyricLine(start, plainText, words, wordSynced = enhanced != null)
+                }
             }
         }
         return out.sortedBy { it.timestampMs }
     }
 
+    /**
+     * Enhanced LRC tags timestamp each following word/segment. Accept it as true
+     * word-sync only when every tagged segment contains exactly one token. If a
+     * segment contains multiple words, fall back to line-sync rather than inventing
+     * per-word timings.
+     */
     private fun parseEnhancedWords(body: String): Pair<String, List<TimedWord>>? {
         val tags = WORD_TAG.findAll(body).toList()
         if (tags.isEmpty()) return null
         val words = ArrayList<TimedWord>()
         val plain = StringBuilder()
         for ((i, tag) in tags.withIndex()) {
-            val segStart = tagMs(tag)
+            val start = tagMs(tag)
             val textFrom = tag.range.last + 1
             val textTo = if (i + 1 < tags.size) tags[i + 1].range.first else body.length
-            val segText = body.substring(textFrom, textTo).trim()
-            if (segText.isBlank()) continue
-            val segEnd = if (i + 1 < tags.size) tagMs(tags[i + 1]) else segStart + 800L
-            words += estimateWords(segText, segStart, max(segEnd, segStart + 200L))
+            val segment = body.substring(textFrom, textTo).trim()
+            if (segment.isBlank()) continue
+            // A timestamp cannot be split accurately across multiple words.
+            if (segment.any { it.isWhitespace() }) return null
+            val end = if (i + 1 < tags.size) tagMs(tags[i + 1]) else Long.MAX_VALUE
+            if (end <= start) return null
+            words += TimedWord(segment, start, end)
             if (plain.isNotEmpty()) plain.append(' ')
-            plain.append(segText)
+            plain.append(segment)
         }
         return if (words.isEmpty()) null else plain.toString() to words
     }
@@ -293,9 +306,8 @@ object LyricsEngine {
         text.lines().map { it.trim() }.filter { it.isNotBlank() }.map { LyricLine(-1L, it) }
 
     /**
-     * Fills in each line's end time and word timings. Word timings are spread across the
-     * line's real duration (from its timestamp to the next line), weighted by word length, so
-     * the highlighted word follows the song rather than a fixed rhythm.
+     * Fills in line end times. Word timings are retained only when the lyric source
+     * supplied genuine per-word timestamps; line-level LRC is never subdivided by guesswork.
      */
     private fun finalizeLines(raw: List<LyricLine>, durationMs: Long): List<LyricLine> {
         val sorted = raw.sortedBy { it.timestampMs }
@@ -310,26 +322,18 @@ object LyricsEngine {
             }
             if (durationMs > 0 && end > durationMs) end = durationMs
             if (end <= line.timestampMs) end = line.timestampMs + 1500L
-            val words = if (line.words.isNotEmpty()) line.words
-            else estimateWords(line.text, line.timestampMs, end)
-            out += line.copy(words = words, endMs = end)
+            val words = if (line.wordSynced && line.words.isNotEmpty()) {
+                line.words.mapIndexed { wordIndex, word ->
+                    if (wordIndex == line.words.lastIndex || word.endMs == Long.MAX_VALUE) {
+                        word.copy(endMs = end)
+                    } else word
+                }
+            } else emptyList()
+            out += line.copy(words = words, endMs = end, wordSynced = line.wordSynced && words.isNotEmpty())
         }
         return out
     }
 
-    private fun estimateWords(text: String, start: Long, end: Long): List<TimedWord> {
-        val words = text.split(Regex("""\s+""")).filter { it.isNotBlank() }
-        if (words.isEmpty()) return emptyList()
-        val weights = words.map { (it.length.coerceAtLeast(1) + 1).toDouble() }
-        val total = weights.sum()
-        val span = (end - start).coerceAtLeast(1L).toDouble()
-        var cursor = start.toDouble()
-        return words.mapIndexed { i, w ->
-            val s = cursor
-            cursor += span * weights[i] / total
-            TimedWord(w, s.roundToLong(), cursor.roundToLong())
-        }
-    }
 
     /** Hindi (Devanagari) or Hinglish (romanized Hindi) versus everything else. */
     fun detectLanguage(text: String): String {
@@ -355,6 +359,7 @@ object LyricsEngine {
         if (!file.exists()) return null
         return runCatching {
             val obj = JSONObject(file.readText())
+            if (obj.optInt("wordTimingVersion", 0) != 2) return null
             if (obj.optBoolean("miss", false)) {
                 val fresh = System.currentTimeMillis() - obj.optLong("ts") < MISS_RETRY_MS
                 return if (fresh) LyricsResult.NONE else null
@@ -372,7 +377,8 @@ object LyricsEngine {
                     timestampMs = lo.getLong("t"),
                     text = lo.getString("x"),
                     words = words,
-                    endMs = lo.optLong("e", Long.MAX_VALUE)
+                    endMs = lo.optLong("e", Long.MAX_VALUE),
+                    wordSynced = lo.optBoolean("wordSynced", false)
                 )
             }
             LyricsResult(
@@ -388,7 +394,7 @@ object LyricsEngine {
     private fun writeCache(context: Context, key: String, result: LyricsResult?) {
         runCatching {
             val dir = File(context.filesDir, CACHE_DIR).apply { mkdirs() }
-            val obj = JSONObject().put("ts", System.currentTimeMillis())
+            val obj = JSONObject().put("ts", System.currentTimeMillis()).put("wordTimingVersion", 2)
             if (result == null || result.lines.isEmpty()) {
                 obj.put("miss", true)
             } else {
@@ -398,7 +404,8 @@ object LyricsEngine {
                 obj.put("match", result.matchLabel)
                 val arr = JSONArray()
                 for (line in result.lines) {
-                    val lo = JSONObject().put("t", line.timestampMs).put("x", line.text).put("e", line.endMs)
+                    val lo = JSONObject().put("t", line.timestampMs).put("x", line.text)
+                    .put("e", line.endMs).put("wordSynced", line.wordSynced)
                     if (line.words.isNotEmpty()) {
                         val wa = JSONArray()
                         for (w in line.words) wa.put(JSONArray().put(w.startMs).put(w.endMs).put(w.text))

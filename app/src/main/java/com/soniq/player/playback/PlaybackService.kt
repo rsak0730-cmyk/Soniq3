@@ -44,6 +44,17 @@ class PlaybackService : MediaSessionService() {
                 if (!isDucked) p.volume = 1.0f
             }
         }
+
+        override fun onPlayerError(error: androidx.media3.common.PlaybackException) {
+            // A track that cannot be opened would otherwise leave the player stuck, so the
+            // next button stops working. Drop that item from the queue and continue.
+            val p = session?.player ?: return
+            if (p.hasNextMediaItem()) {
+                p.removeMediaItem(p.currentMediaItemIndex)
+                p.prepare()
+                p.play()
+            }
+        }
     }
 
     override fun onCreate() {

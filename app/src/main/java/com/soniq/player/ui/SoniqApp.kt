@@ -269,6 +269,62 @@ fun SongThumb(song: Song, modifier: Modifier = Modifier) {
     }
 }
 
+/** Which song is playing right now, shared by every list so each row can show the live indicator. */
+object NowPlayingState {
+    var songId by mutableStateOf<Long?>(null)
+    var playing by mutableStateOf(false)
+}
+
+/** Animated neon border and glow for the row that is currently playing. */
+@Composable
+fun Modifier.nowPlayingGlow(): Modifier {
+    val t by rememberInfiniteTransition(label = "now_glow").animateFloat(
+        initialValue = 0f,
+        targetValue = 1f,
+        animationSpec = infiniteRepeatable(tween(2400, easing = LinearEasing), RepeatMode.Restart),
+        label = "now_sweep"
+    )
+    val shape = RoundedCornerShape(20.dp)
+    return this
+        .shadow(10.dp, shape, ambientColor = NeonGlow, spotColor = NeonGlow)
+        .border(
+            width = 2.dp,
+            brush = Brush.linearGradient(
+                colors = listOf(NeonBlue, GlassBlueA, NeonBlue),
+                start = Offset(t * 700f - 350f, 0f),
+                end = Offset(t * 700f + 350f, 700f)
+            ),
+            shape = shape
+        )
+}
+
+/** Three bouncing bars drawn over the thumbnail of the playing song. */
+@Composable
+fun NowPlayingBars(modifier: Modifier = Modifier) {
+    val t by rememberInfiniteTransition(label = "eq_bars").animateFloat(
+        initialValue = 0f,
+        targetValue = 1f,
+        animationSpec = infiniteRepeatable(tween(900, easing = LinearEasing), RepeatMode.Restart),
+        label = "eq_t"
+    )
+    Canvas(modifier.clip(RoundedCornerShape(16.dp)).background(Color(0x99102A3A))) {
+        val barW = size.width * 0.14f
+        val gap = size.width * 0.08f
+        val startX = (size.width - (3 * barW + 2 * gap)) / 2f
+        for (i in 0 until 3) {
+            val phase = (t + i * 0.33f) % 1f
+            val wave = kotlin.math.sin(phase.toDouble() * kotlin.math.PI).toFloat()
+            val h = size.height * (0.30f + 0.45f * kotlin.math.abs(wave))
+            drawRoundRect(
+                brush = Brush.verticalGradient(listOf(NeonBlue, GlassBlueA)),
+                topLeft = Offset(startX + i * (barW + gap), (size.height - h) / 2f),
+                size = Size(barW, h),
+                cornerRadius = CornerRadius(2.dp.toPx(), 2.dp.toPx())
+            )
+        }
+    }
+}
+
 @Composable
 fun SongCard(
     song: Song,
@@ -280,20 +336,26 @@ fun SongCard(
     onEdit: () -> Unit
 ) {
     var menuExpanded by remember { mutableStateOf(false) }
+    val isNow = NowPlayingState.songId == song.id
+    val playingNow = isNow && NowPlayingState.playing
     BouncyButton(onClick = onPlay, modifier = Modifier.fillMaxWidth()) {
         Row(
             Modifier
                 .fillMaxWidth()
                 .neuRaised(cornerRadius = 20.dp, depth = 6.dp)
+                .then(if (isNow) Modifier.nowPlayingGlow() else Modifier)
                 .padding(10.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            SongThumb(song, Modifier.size(48.dp))
+            Box(Modifier.size(48.dp), contentAlignment = Alignment.Center) {
+                SongThumb(song, Modifier.fillMaxSize())
+                if (playingNow) NowPlayingBars(Modifier.fillMaxSize())
+            }
             Spacer(Modifier.width(12.dp))
             Column(Modifier.weight(1f)) {
                 Text(
                     song.title,
-                    color = NeoInk,
+                    color = if (isNow) NeonBlue else NeoInk,
                     fontWeight = FontWeight.SemiBold,
                     fontSize = 14.sp,
                     maxLines = 1,
@@ -644,7 +706,15 @@ fun LiquidWaterWaveBackground(
         animationSpec = infiniteRepeatable(tween(if (isPlaying) 8500 else 16000, easing = LinearEasing), RepeatMode.Restart),
         label = "wave2"
     )
-    // Soft mint background with a gently drifting light sheen (the playback shimmer feature, now neumorphic).
+    val animPrimary by animateColorAsState(primaryColor, tween(1200), label = "bgPrimary")
+    val animSecondary by animateColorAsState(secondaryColor, tween(1200), label = "bgSecondary")
+    val glowPulse by infiniteTransition.animateFloat(
+        initialValue = 0.6f,
+        targetValue = 1f,
+        animationSpec = infiniteRepeatable(tween(if (isPlaying) 1800 else 4200, easing = FastOutSlowInEasing), RepeatMode.Reverse),
+        label = "bgPulse"
+    )
+    // Soft mint background with drifting light and colour blobs that shift with the artwork palette.
     Canvas(modifier = modifier.fillMaxSize()) {
         val w = size.width
         val h = size.height
@@ -673,7 +743,7 @@ fun LiquidWaterWaveBackground(
         drawCircle(
             brush = Brush.radialGradient(
                 colors = listOf(
-                    secondaryColor.copy(alpha = if (isPlaying) 0.10f else 0.05f),
+                    animSecondary.copy(alpha = (if (isPlaying) 0.16f else 0.08f) * glowPulse),
                     NeoAccentSoft.copy(alpha = 0.04f),
                     Color.Transparent
                 ),
@@ -682,6 +752,21 @@ fun LiquidWaterWaveBackground(
             ),
             radius = r2,
             center = Offset(x2, y2)
+        )
+        val x3 = w * (0.78f + 0.10f * sin((t2 * 1.1f).toDouble()).toFloat())
+        val y3 = h * (0.90f - 0.08f * cos((t1 * 0.7f).toDouble()).toFloat())
+        val r3 = w * 0.70f
+        drawCircle(
+            brush = Brush.radialGradient(
+                colors = listOf(
+                    animPrimary.copy(alpha = (if (isPlaying) 0.14f else 0.07f) * glowPulse),
+                    Color.Transparent
+                ),
+                center = Offset(x3, y3),
+                radius = r3
+            ),
+            radius = r3,
+            center = Offset(x3, y3)
         )
     }
 }
@@ -698,44 +783,97 @@ fun RoundedRectTimelineCenterpiece(
 ) {
     val amplitudes = RealtimeFftMonitor.amplitudes
     val numBars = 22
+    val infinite = rememberInfiniteTransition(label = "artwork_fx")
+    val sweep by infinite.animateFloat(
+        initialValue = 0f,
+        targetValue = 1f,
+        animationSpec = infiniteRepeatable(tween(3600, easing = LinearEasing), RepeatMode.Restart),
+        label = "art_sweep"
+    )
+    val breathe by infinite.animateFloat(
+        initialValue = 1f,
+        targetValue = 1.02f,
+        animationSpec = infiniteRepeatable(tween(2400, easing = FastOutSlowInEasing), RepeatMode.Reverse),
+        label = "art_breathe"
+    )
+    val accent by animateColorAsState(primaryColor, tween(900), label = "art_accent")
+    val accent2 by animateColorAsState(secondaryColor, tween(900), label = "art_accent2")
 
-    // Upright rounded card. There is no gyroscope rotation here, so the artwork never tilts.
+    // Upright rounded card with an animated neon rim. No gyroscope rotation, so it never tilts.
     Box(
         modifier = modifier
             .aspectRatio(1f)
-            .neuRaised(cornerRadius = 36.dp, depth = 12.dp),
+            .neuRaised(cornerRadius = 40.dp, depth = 14.dp),
         contentAlignment = Alignment.Center
     ) {
         Box(
             modifier = Modifier
-                .fillMaxSize(0.92f)
-                .clip(RoundedCornerShape(30.dp))
-        ) {
-            SongThumb(song = song, modifier = Modifier.fillMaxSize())
-            Canvas(modifier = Modifier.fillMaxSize()) {
-                val w = size.width
-                val h = size.height
-                drawRect(
-                    brush = Brush.verticalGradient(
-                        0.55f to Color.Transparent,
-                        1.0f to Color(0xD9102A3A)
+                .fillMaxSize(0.94f)
+                .clip(RoundedCornerShape(36.dp))
+                .background(
+                    Brush.linearGradient(
+                        colors = listOf(accent, GlassBlueA, accent2, GlassBlueB, accent),
+                        start = Offset(sweep * 900f - 450f, 0f),
+                        end = Offset(sweep * 900f + 450f, 900f)
                     )
                 )
-                val barWidth = 4.dp.toPx()
-                val totalBarsWidth = numBars * barWidth
-                val spacing = (w * 0.78f - totalBarsWidth) / (numBars - 1).coerceAtLeast(1)
-                val startX = w * 0.11f
-                val bottomY = h - 16.dp.toPx()
-                for (i in 0 until numBars) {
-                    val amp = if (isPlaying) amplitudes[i % amplitudes.size] else 0.08f
-                    val barHeight = (44.dp.toPx() * amp).coerceIn(4.dp.toPx(), 40.dp.toPx())
-                    val bx = startX + i * (barWidth + spacing)
-                    drawRoundRect(
-                        brush = Brush.verticalGradient(listOf(GlassBlueA, GlassBlueB)),
-                        topLeft = Offset(bx, bottomY - barHeight),
-                        size = Size(barWidth, barHeight),
-                        cornerRadius = CornerRadius(2.dp.toPx(), 2.dp.toPx())
+                .padding(3.dp)
+        ) {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .clip(RoundedCornerShape(33.dp))
+                    .background(NeoBg)
+            ) {
+                SongThumb(
+                    song = song,
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .graphicsLayer { scaleX = breathe; scaleY = breathe }
+                )
+                Canvas(modifier = Modifier.fillMaxSize()) {
+                    val w = size.width
+                    val h = size.height
+                    // Glass gloss across the top.
+                    drawRect(
+                        brush = Brush.verticalGradient(
+                            0f to Color.White.copy(alpha = 0.28f),
+                            0.45f to Color.Transparent
+                        ),
+                        size = Size(w, h * 0.5f)
                     )
+                    // Moving light sheen.
+                    drawRect(
+                        brush = Brush.linearGradient(
+                            0f to Color.Transparent,
+                            0.5f to Color.White.copy(alpha = 0.18f),
+                            1f to Color.Transparent,
+                            start = Offset(sweep * w * 2f - w, 0f),
+                            end = Offset(sweep * w * 2f, h)
+                        )
+                    )
+                    // Dark base for the visualiser.
+                    drawRect(
+                        brush = Brush.verticalGradient(
+                            0.55f to Color.Transparent,
+                            1.0f to Color(0xD9102A3A)
+                        )
+                    )
+                    val barWidth = 4.dp.toPx()
+                    val spacing = (w * 0.78f - numBars * barWidth) / (numBars - 1).coerceAtLeast(1)
+                    val startX = w * 0.11f
+                    val bottomY = h - 16.dp.toPx()
+                    for (i in 0 until numBars) {
+                        val amp = if (isPlaying) amplitudes[i % amplitudes.size] else 0.08f
+                        val barHeight = (44.dp.toPx() * amp).coerceIn(4.dp.toPx(), 40.dp.toPx())
+                        val bx = startX + i * (barWidth + spacing)
+                        drawRoundRect(
+                            brush = Brush.verticalGradient(listOf(accent, GlassBlueA)),
+                            topLeft = Offset(bx, bottomY - barHeight),
+                            size = Size(barWidth, barHeight),
+                            cornerRadius = CornerRadius(2.dp.toPx(), 2.dp.toPx())
+                        )
+                    }
                 }
             }
         }
@@ -1739,6 +1877,26 @@ fun SoniqApp() {
         if (openFullPlayer) showPlayer = true
     }
 
+    fun skipTrack(forward: Boolean) {
+        val c = controller ?: return
+        // After an error the player sits idle; re-prepare it so the skip is not ignored.
+        if (c.playerError != null || c.playbackState == Player.STATE_IDLE) {
+            c.prepare()
+        }
+        if (forward) {
+            when {
+                c.hasNextMediaItem() -> c.seekToNextMediaItem()
+                c.repeatMode == Player.REPEAT_MODE_ALL -> c.seekToDefaultPosition(0)
+                else -> return
+            }
+        } else {
+            // Like most players: a previous tap in the first 3 seconds goes to the previous track.
+            if (c.currentPosition > 3000L || !c.hasPreviousMediaItem()) c.seekTo(0L)
+            else c.seekToPreviousMediaItem()
+        }
+        c.play()
+    }
+
     fun triggerBatchFix() {
         if (isBatchFixing) return
         val autoIds = prefs.getStringSet("auto_fixed_ids", emptySet())?.toSet() ?: emptySet()
@@ -1921,6 +2079,11 @@ fun SoniqApp() {
             }
             delay(150)
         }
+    }
+
+    LaunchedEffect(currentSong?.id, isPlaying) {
+        NowPlayingState.songId = currentSong?.id
+        NowPlayingState.playing = isPlaying
     }
 
     LaunchedEffect(timerMinutes) {
@@ -2205,7 +2368,7 @@ fun SoniqApp() {
                         secondaryColor = dynamicSecondaryColor,
                         onOpen = { showPlayer = true },
                         onPlayPause = { controller?.let { if (it.isPlaying) it.pause() else it.play() } },
-                        onNext = { controller?.seekToNextMediaItem() }
+                        onNext = { skipTrack(true) }
                     )
                 }
                 FloatingBottomNavBar(
@@ -2268,8 +2431,8 @@ fun SoniqApp() {
                         onClose = { showPlayer = false },
                         onOpenLockScreen = { showDeepOceanLockScreen = true },
                         onPlayPause = { controller?.let { if (it.isPlaying) it.pause() else it.play() } },
-                        onNext = { controller?.seekToNextMediaItem() },
-                        onPrevious = { controller?.seekToPreviousMediaItem() },
+                        onNext = { skipTrack(true) },
+                        onPrevious = { skipTrack(false) },
                         onSeek = { controller?.seekTo(it) },
                         onShuffle = { shuffle = !shuffle; controller?.shuffleModeEnabled = shuffle },
                         onRepeat = {
@@ -2306,8 +2469,8 @@ fun SoniqApp() {
                     gyroPitch = gyroEngine.pitch,
                     gyroRoll = gyroEngine.roll,
                     onPlayPause = { controller?.let { if (it.isPlaying) it.pause() else it.play() } },
-                    onNext = { controller?.seekToNextMediaItem() },
-                    onPrevious = { controller?.seekToPreviousMediaItem() },
+                    onNext = { skipTrack(true) },
+                    onPrevious = { skipTrack(false) },
                     onSeek = { controller?.seekTo(it) },
                     onShuffle = { shuffle = !shuffle; controller?.shuffleModeEnabled = shuffle },
                     onRepeat = {

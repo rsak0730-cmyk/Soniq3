@@ -55,6 +55,15 @@ object AudioFingerprintFixer {
     @Volatile var lastRunNetworkFailures: Int = 0
         private set
     private val networkFailures = AtomicInteger(0)
+    @Volatile private var firstFailure: String? = null
+    /** First network or catalog error seen in the last batch run, shown in the summary. */
+    @Volatile var lastRunFirstError: String? = null
+        private set
+
+    private fun noteFailure(detail: String) {
+        networkFailures.incrementAndGet()
+        synchronized(this) { if (firstFailure == null) firstFailure = detail }
+    }
     private const val USER_AGENT = "Mozilla/5.0 (Android; Mobile) SONIQ/1.0"
 
     private val SPAM_PATTERNS = listOf(
@@ -253,9 +262,10 @@ object AudioFingerprintFixer {
                     setRequestProperty("User-Agent", USER_AGENT)
                     setRequestProperty("Accept", "application/json")
                 }
-                if (conn.responseCode != 200) {
+                val code = conn.responseCode
+                if (code != 200) {
+                    noteFailure("HTTP $code from $baseUrl")
                     conn.disconnect()
-                    networkFailures.incrementAndGet()
                     continue
                 }
                 val text = conn.inputStream.bufferedReader().use { it.readText() }
@@ -289,8 +299,8 @@ object AudioFingerprintFixer {
                         artUrl = artUrl
                     )
                 }
-            } catch (_: Exception) {
-                networkFailures.incrementAndGet()
+            } catch (e: Exception) {
+                noteFailure("${e.javaClass.simpleName} from $baseUrl: ${e.message}")
                 continue
             }
         }
@@ -308,9 +318,10 @@ object AudioFingerprintFixer {
                 setRequestProperty("User-Agent", USER_AGENT)
                 setRequestProperty("Accept", "application/json")
             }
-            if (conn.responseCode != 200) {
+            val code = conn.responseCode
+            if (code != 200) {
+                noteFailure("HTTP $code from iTunes")
                 conn.disconnect()
-                networkFailures.incrementAndGet()
                 return emptyList()
             }
             val text = conn.inputStream.bufferedReader().use { it.readText() }
@@ -328,8 +339,8 @@ object AudioFingerprintFixer {
                     artUrl = item.optString("artworkUrl100", "").replace("100x100bb", "600x600bb").ifBlank { null }
                 )
             }
-        } catch (_: Exception) {
-            networkFailures.incrementAndGet()
+        } catch (e: Exception) {
+            noteFailure("${e.javaClass.simpleName} from iTunes: ${e.message}")
             emptyList()
         }
     }
@@ -390,6 +401,7 @@ object AudioFingerprintFixer {
         val total = songs.size
         if (total == 0) return@withContext 0
         networkFailures.set(0)
+        firstFailure = null
 
         val fixedCount = AtomicInteger(0)
         val done = AtomicInteger(0)
@@ -418,6 +430,7 @@ object AudioFingerprintFixer {
             }.awaitAll()
         }
         lastRunNetworkFailures = networkFailures.get()
+        lastRunFirstError = firstFailure
         fixedCount.get()
     }
 }

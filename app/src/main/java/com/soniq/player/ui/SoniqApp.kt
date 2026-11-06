@@ -34,7 +34,6 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.*
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
@@ -47,7 +46,6 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -70,6 +68,11 @@ import com.soniq.player.audio.GyroscopeParallaxEngine
 import com.soniq.player.audio.RealtimeFftMonitor
 import com.soniq.player.data.*
 import com.soniq.player.playback.PlaybackService
+import com.soniq.player.ui.theme.*
+import com.soniq.player.data.LyricsResult
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.text.TextStyle
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -78,30 +81,21 @@ import org.json.JSONObject
 import java.io.File
 import kotlin.math.*
 
-private val OLEDBlack = Color(0xFF040308)
-private val NeonPurple = Color(0xFF9B6CFF)
-private val DeepViolet = Color(0xFF6B2BEE)
-private val ElectricCyan = Color(0xFF53F6FF)
-private val AquaGlow = Color(0xFF26E0FA)
-private val MutedLavender = Color(0xFFC7BCE0)
-private val GlassPill = Color(0x351F143D)
-private val GlassBorder = Color(0x5553F6FF)
+// Palette aliases. The actual colors live in ui/theme/SoniqPalette.kt.
+private val OLEDBlack = NeoBg
+private val NeonPurple = Color(0xFF4B6FD6)
+private val DeepViolet = NeoAccent
+private val ElectricCyan = NeoAccent
+private val AquaGlow = NeoAccentSoft
+private val MutedLavender = NeoMuted
+private val GlassPill = NeoSurface
+private val GlassBorder = NeoEdge
 
-private val DeepOceanAbyss = Color(0xFF030A16)
-private val OceanNavyDeep = Color(0xFF081C36)
-private val BioluminescentCyan = Color(0xFF38E1FF)
-private val OceanMistGlass = Color(0x280B2B4D)
-private val OceanGlassBorder = Color(0x4438E1FF)
-
-// Image 1 Liquid Glass Theme Elements
-private val LiquidGlassBackground = Color(0x1A00C3FF)
-private val LiquidGlassBorder = Color(0x4400C3FF)
-private val LiquidGlassGlow = Color(0x8800C3FF)
-
-// Image 2 Neumorphic Elements
-private val NeumorphicBase = Color(0xFF161622)
-private val NeumorphicHighlight = Color(0x22FFFFFF)
-private val NeumorphicShadow = Color(0x99000000)
+private val DeepOceanAbyss = NeoBg
+private val OceanNavyDeep = Color(0xFFB4CCC3)
+private val BioluminescentCyan = NeoAccent
+private val OceanMistGlass = Color(0x80FFFFFF)
+private val OceanGlassBorder = NeoEdge
 
 enum class MainTab(val label: String, val icon: ImageVector) {
     HOME("Home", Icons.Default.Home),
@@ -143,6 +137,21 @@ private fun saveMetadataOverride(prefs: SharedPreferences, songId: Long, title: 
         root.put(songId.toString(), entry)
         prefs.edit().putString("song_overrides", root.toString()).apply()
     }
+}
+
+private fun removeMetadataOverride(prefs: SharedPreferences, songId: Long) {
+    runCatching {
+        val root = JSONObject(prefs.getString("song_overrides", "{}") ?: "{}")
+        root.remove(songId.toString())
+        prefs.edit().putString("song_overrides", root.toString()).apply()
+    }
+}
+
+/** Tracks whose title/artist came from the auto-fixer. A manual edit clears the flag. */
+private fun markAutoFixed(prefs: SharedPreferences, songId: Long, add: Boolean) {
+    val current = prefs.getStringSet("auto_fixed_ids", emptySet())?.toMutableSet() ?: mutableSetOf()
+    if (add) current.add(songId.toString()) else current.remove(songId.toString())
+    prefs.edit().putStringSet("auto_fixed_ids", current).apply()
 }
 
 private fun timeText(ms: Long): String {
@@ -195,60 +204,123 @@ fun BouncyIconButton(
 @Composable
 fun SongThumb(song: Song, modifier: Modifier = Modifier) {
     val context = LocalContext.current
-    var embeddedBitmap by remember(song.id, song.albumArtUri) { mutableStateOf<ImageBitmap?>(null) }
+    val a = song.albumArtUri.orEmpty()
+    val isFileArt = a.startsWith("file://")
+    val isRemoteArt = a.startsWith("http://") || a.startsWith("https://")
+    val isMediaStoreArt = a.startsWith("content://")
 
-    val validFileOverride = remember(song.albumArtUri) {
-        if (!song.albumArtUri.isNullOrBlank() && song.albumArtUri.startsWith("file://")) {
-            val path = Uri.parse(song.albumArtUri).path
-            path != null && File(path).let { it.exists() && it.length() > 512 }
-        } else false
+    // A re-fixed cover is a new file, and its timestamp changes the cache key, so the new image shows at once.
+    val fileReady = remember(a) {
+        isFileArt && runCatching {
+            val f = File(Uri.parse(a).path.orEmpty())
+            f.exists() && f.length() > 512
+        }.getOrDefault(false)
+    }
+    val artVersion = remember(a) {
+        if (isFileArt) runCatching { File(Uri.parse(a).path.orEmpty()).lastModified() }.getOrDefault(0L) else 0L
     }
 
-    val isHttpOverride = remember(song.albumArtUri) {
-        !song.albumArtUri.isNullOrBlank() && song.albumArtUri.startsWith("http")
-    }
-
-    LaunchedEffect(song.id, song.albumArtUri) {
-        if (!validFileOverride && !isHttpOverride) {
-            withContext(Dispatchers.IO) {
-                val bytes = MusicRepository.extractEmbeddedPicture(context, song.uri)
-                if (bytes != null) {
-                    val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
-                    if (bmp != null) {
-                        embeddedBitmap = bmp.asImageBitmap()
-                    }
+    // Fallback 1: the picture embedded in the audio file's own tags.
+    var embedded by remember(song.id, song.uri) { mutableStateOf<ImageBitmap?>(null) }
+    LaunchedEffect(song.id, song.uri, fileReady, isRemoteArt) {
+        if (!fileReady && !isRemoteArt) {
+            embedded = withContext(Dispatchers.IO) {
+                MusicRepository.extractEmbeddedPicture(context, song.uri)?.let { bytes ->
+                    BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.asImageBitmap()
                 }
             }
         }
     }
+    val embeddedBitmap = embedded
 
-    val baseModifier = modifier.aspectRatio(1f)
+    val request: ImageRequest? = if (fileReady || isRemoteArt || isMediaStoreArt) {
+        ImageRequest.Builder(context)
+            .data(a)
+            .memoryCacheKey("$a#$artVersion")
+            .crossfade(true)
+            .build()
+    } else null
 
-    if ((validFileOverride || isHttpOverride) && !song.albumArtUri.isNullOrBlank()) {
-        AsyncImage(
-            model = ImageRequest.Builder(context).data(song.albumArtUri).crossfade(true).build(),
-            contentDescription = "Artwork",
-            contentScale = ContentScale.Crop,
-            modifier = baseModifier.clip(RoundedCornerShape(16.dp))
+    // Order: a fixed cover (file/web) first, then embedded art, then the MediaStore album art.
+    // The placeholder icon sits underneath, so a failed load still shows a clean tile.
+    Box(
+        modifier = modifier
+            .aspectRatio(1f)
+            .clip(RoundedCornerShape(16.dp))
+            .background(Brush.radialGradient(listOf(NeoInset, NeoBg)))
+            .border(1.dp, NeoEdge, RoundedCornerShape(16.dp)),
+        contentAlignment = Alignment.Center
+    ) {
+        Icon(Icons.Default.MusicNote, null, tint = NeoAccent.copy(alpha = 0.6f), modifier = Modifier.size(36.dp))
+        when {
+            request != null && (fileReady || isRemoteArt || embeddedBitmap == null) -> AsyncImage(
+                model = request,
+                contentDescription = "Artwork",
+                contentScale = ContentScale.Crop,
+                modifier = Modifier.fillMaxSize()
+            )
+            embeddedBitmap != null -> Image(
+                bitmap = embeddedBitmap,
+                contentDescription = "Artwork",
+                contentScale = ContentScale.Crop,
+                modifier = Modifier.fillMaxSize()
+            )
+        }
+    }
+}
+
+/** Which song is playing right now, shared by every list so each row can show the live indicator. */
+object NowPlayingState {
+    var songId by mutableStateOf<Long?>(null)
+    var playing by mutableStateOf(false)
+}
+
+/** Animated neon border and glow for the row that is currently playing. */
+@Composable
+fun Modifier.nowPlayingGlow(): Modifier {
+    val t by rememberInfiniteTransition(label = "now_glow").animateFloat(
+        initialValue = 0f,
+        targetValue = 1f,
+        animationSpec = infiniteRepeatable(tween(2400, easing = LinearEasing), RepeatMode.Restart),
+        label = "now_sweep"
+    )
+    val shape = RoundedCornerShape(20.dp)
+    return this
+        .shadow(10.dp, shape, ambientColor = NeonGlow, spotColor = NeonGlow)
+        .border(
+            width = 2.dp,
+            brush = Brush.linearGradient(
+                colors = listOf(NeonBlue, GlassBlueA, NeonBlue),
+                start = Offset(t * 700f - 350f, 0f),
+                end = Offset(t * 700f + 350f, 700f)
+            ),
+            shape = shape
         )
-    } else if (embeddedBitmap != null) {
-        Image(
-            bitmap = embeddedBitmap!!,
-            contentDescription = "Artwork",
-            contentScale = ContentScale.Crop,
-            modifier = baseModifier.clip(RoundedCornerShape(16.dp))
-        )
-    } else {
-        Box(
-            modifier = baseModifier
-                .background(
-                    Brush.radialGradient(listOf(Color(0xFF281850), Color(0xFF0F0922))),
-                    RoundedCornerShape(16.dp)
-                )
-                .border(1.dp, GlassBorder, RoundedCornerShape(16.dp)),
-            contentAlignment = Alignment.Center
-        ) {
-            Icon(Icons.Default.MusicNote, null, tint = ElectricCyan.copy(alpha = 0.85f), modifier = Modifier.size(36.dp))
+}
+
+/** Three bouncing bars drawn over the thumbnail of the playing song. */
+@Composable
+fun NowPlayingBars(modifier: Modifier = Modifier) {
+    val t by rememberInfiniteTransition(label = "eq_bars").animateFloat(
+        initialValue = 0f,
+        targetValue = 1f,
+        animationSpec = infiniteRepeatable(tween(900, easing = LinearEasing), RepeatMode.Restart),
+        label = "eq_t"
+    )
+    Canvas(modifier.clip(RoundedCornerShape(16.dp)).background(Color(0x99102A3A))) {
+        val barW = size.width * 0.14f
+        val gap = size.width * 0.08f
+        val startX = (size.width - (3 * barW + 2 * gap)) / 2f
+        for (i in 0 until 3) {
+            val phase = (t + i * 0.33f) % 1f
+            val wave = kotlin.math.sin(phase.toDouble() * kotlin.math.PI).toFloat()
+            val h = size.height * (0.30f + 0.45f * kotlin.math.abs(wave))
+            drawRoundRect(
+                brush = Brush.verticalGradient(listOf(NeonBlue, GlassBlueA)),
+                topLeft = Offset(startX + i * (barW + gap), (size.height - h) / 2f),
+                size = Size(barW, h),
+                cornerRadius = CornerRadius(2.dp.toPx(), 2.dp.toPx())
+            )
         }
     }
 }
@@ -264,74 +336,79 @@ fun SongCard(
     onEdit: () -> Unit
 ) {
     var menuExpanded by remember { mutableStateOf(false) }
+    val isNow = NowPlayingState.songId == song.id
+    val playingNow = isNow && NowPlayingState.playing
     BouncyButton(onClick = onPlay, modifier = Modifier.fillMaxWidth()) {
-        Surface(
-            color = GlassPill,
-            shape = RoundedCornerShape(20.dp),
-            border = BorderStroke(1.2.dp, GlassBorder),
-            modifier = Modifier.fillMaxWidth()
+        Row(
+            Modifier
+                .fillMaxWidth()
+                .neuRaised(cornerRadius = 20.dp, depth = 6.dp)
+                .then(if (isNow) Modifier.nowPlayingGlow() else Modifier)
+                .padding(10.dp),
+            verticalAlignment = Alignment.CenterVertically
         ) {
-            Row(Modifier.padding(10.dp), verticalAlignment = Alignment.CenterVertically) {
-                SongThumb(song, Modifier.size(48.dp))
-                Spacer(Modifier.width(12.dp))
-                Column(Modifier.weight(1f)) {
-                    Text(
-                        song.title,
-                        color = Color.White,
-                        fontWeight = FontWeight.SemiBold,
-                        fontSize = 14.sp,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
-                    Text(
-                        "${song.artist} • ${song.album}",
-                        color = MutedLavender,
-                        fontSize = 11.sp,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
-                    Text(
-                        "${song.folder} • ${timeText(song.durationMs)}",
-                        color = ElectricCyan.copy(alpha = 0.8f),
-                        fontSize = 10.sp
-                    )
+            Box(Modifier.size(48.dp), contentAlignment = Alignment.Center) {
+                SongThumb(song, Modifier.fillMaxSize())
+                if (playingNow) NowPlayingBars(Modifier.fillMaxSize())
+            }
+            Spacer(Modifier.width(12.dp))
+            Column(Modifier.weight(1f)) {
+                Text(
+                    song.title,
+                    color = if (isNow) NeonBlue else NeoInk,
+                    fontWeight = FontWeight.SemiBold,
+                    fontSize = 14.sp,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+                Text(
+                    "${song.artist} • ${song.album}",
+                    color = MutedLavender,
+                    fontSize = 11.sp,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+                Text(
+                    "${song.folder} • ${timeText(song.durationMs)}",
+                    color = NeoAccent.copy(alpha = 0.85f),
+                    fontSize = 10.sp
+                )
+            }
+            IconButton(onClick = onFavorite, modifier = Modifier.size(34.dp)) {
+                Icon(
+                    if (favorite) Icons.Default.Favorite else Icons.Default.FavoriteBorder,
+                    contentDescription = "Favorite",
+                    tint = if (favorite) NeoDanger else MutedLavender,
+                    modifier = Modifier.size(19.dp)
+                )
+            }
+            IconButton(onClick = onEdit, modifier = Modifier.size(34.dp)) {
+                Icon(Icons.Default.AutoFixHigh, "Auto-Fix", tint = NeoAccent, modifier = Modifier.size(19.dp))
+            }
+            Box {
+                IconButton(onClick = { menuExpanded = true }, modifier = Modifier.size(32.dp)) {
+                    Icon(Icons.Default.MoreVert, contentDescription = "More", tint = MutedLavender, modifier = Modifier.size(19.dp))
                 }
-                IconButton(onClick = onFavorite, modifier = Modifier.size(34.dp)) {
-                    Icon(
-                        if (favorite) Icons.Default.Favorite else Icons.Default.FavoriteBorder,
-                        contentDescription = "Favorite",
-                        tint = if (favorite) Color(0xFFFF5286) else MutedLavender,
-                        modifier = Modifier.size(19.dp)
+                DropdownMenu(
+                    expanded = menuExpanded,
+                    onDismissRequest = { menuExpanded = false },
+                    modifier = Modifier.background(NeoDialog)
+                ) {
+                    DropdownMenuItem(
+                        text = { Text("Add to Playlist", color = NeoInk) },
+                        leadingIcon = { Icon(Icons.Default.PlaylistAdd, null, tint = NeoAccent) },
+                        onClick = { menuExpanded = false; onAddToPlaylist() }
                     )
-                }
-                IconButton(onClick = onEdit, modifier = Modifier.size(34.dp)) {
-                    Icon(Icons.Default.AutoFixHigh, "Auto-Fix", tint = ElectricCyan, modifier = Modifier.size(19.dp))
-                }
-                Box {
-                    IconButton(onClick = { menuExpanded = true }, modifier = Modifier.size(32.dp)) {
-                        Icon(Icons.Default.MoreVert, contentDescription = "More", tint = MutedLavender, modifier = Modifier.size(19.dp))
-                    }
-                    DropdownMenu(
-                        expanded = menuExpanded,
-                        onDismissRequest = { menuExpanded = false },
-                        modifier = Modifier.background(Color(0xFF1E1436))
-                    ) {
-                        DropdownMenuItem(
-                            text = { Text("Add to Playlist", color = Color.White) },
-                            leadingIcon = { Icon(Icons.Default.PlaylistAdd, null, tint = ElectricCyan) },
-                            onClick = { menuExpanded = false; onAddToPlaylist() }
-                        )
-                        DropdownMenuItem(
-                            text = { Text("Add to Custom Album", color = Color.White) },
-                            leadingIcon = { Icon(Icons.Default.Album, null, tint = NeonPurple) },
-                            onClick = { menuExpanded = false; onAddToAlbum() }
-                        )
-                        DropdownMenuItem(
-                            text = { Text("Edit Metadata / Auto-Fix", color = Color.White) },
-                            leadingIcon = { Icon(Icons.Default.AutoFixHigh, null, tint = ElectricCyan) },
-                            onClick = { menuExpanded = false; onEdit() }
-                        )
-                    }
+                    DropdownMenuItem(
+                        text = { Text("Add to Custom Album", color = NeoInk) },
+                        leadingIcon = { Icon(Icons.Default.Album, null, tint = NeonPurple) },
+                        onClick = { menuExpanded = false; onAddToAlbum() }
+                    )
+                    DropdownMenuItem(
+                        text = { Text("Edit Metadata / Auto-Fix", color = NeoInk) },
+                        leadingIcon = { Icon(Icons.Default.AutoFixHigh, null, tint = NeoAccent) },
+                        onClick = { menuExpanded = false; onEdit() }
+                    )
                 }
             }
         }
@@ -349,7 +426,7 @@ fun GroupCard(
 ) {
     BouncyButton(onClick = onClick, modifier = Modifier.fillMaxWidth()) {
         Surface(
-            color = GlassPill,
+            color = NeoSurface, shadowElevation = 6.dp,
             shape = RoundedCornerShape(20.dp),
             border = BorderStroke(1.2.dp, if (isCustom) ElectricCyan.copy(alpha = 0.7f) else GlassBorder),
             modifier = Modifier.fillMaxWidth()
@@ -365,13 +442,13 @@ fun GroupCard(
                             .background(Brush.linearGradient(listOf(NeonPurple.copy(alpha = 0.5f), ElectricCyan.copy(alpha = 0.5f)))),
                         contentAlignment = Alignment.Center
                     ) {
-                        Icon(icon, null, tint = Color.White)
+                        Icon(icon, null, tint = NeoInk)
                     }
                 }
                 Spacer(Modifier.width(14.dp))
                 Column(Modifier.weight(1f)) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
-                        Text(title, color = Color.White, fontWeight = FontWeight.SemiBold, fontSize = 15.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        Text(title, color = NeoInk, fontWeight = FontWeight.SemiBold, fontSize = 15.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
                         if (isCustom) {
                             Spacer(Modifier.width(6.dp))
                             Surface(shape = RoundedCornerShape(6.dp), color = NeonPurple.copy(alpha = 0.4f)) {
@@ -464,7 +541,7 @@ fun SamsungAlphabetScroller(
                     .size(44.dp)
                     .clip(CircleShape)
                     .background(Brush.radialGradient(listOf(ElectricCyan, NeonPurple)))
-                    .border(1.5.dp, Color.White, CircleShape),
+                    .border(1.5.dp, NeoInk, CircleShape),
                 contentAlignment = Alignment.Center
             ) {
                 Text(text = letter.toString(), color = OLEDBlack, fontSize = 20.sp, fontWeight = FontWeight.Black)
@@ -485,43 +562,66 @@ fun FloatingMiniPlayer(
     onNext: () -> Unit,
     modifier: Modifier = Modifier
 ) {
-    Surface(
+    val shape = RoundedCornerShape(24.dp)
+    Column(
         modifier = modifier
             .fillMaxWidth()
-            .height(64.dp)
-            .clickable { onOpen() },
-        shape = RoundedCornerShape(22.dp),
-        color = Color(0xEE140E2A),
-        border = BorderStroke(1.2.dp, secondaryColor.copy(alpha = 0.55f))
+            .height(72.dp)
+            .neuRaised(cornerRadius = 24.dp, depth = 7.dp)
+            .clip(shape)
+            .clickable { onOpen() }
     ) {
-        Column(Modifier.fillMaxSize()) {
-            LinearProgressIndicator(
-                progress = { progress },
-                modifier = Modifier.fillMaxWidth().height(2.5.dp),
-                color = secondaryColor,
-                trackColor = Color.Transparent
-            )
-            Row(
-                Modifier.fillMaxSize().padding(horizontal = 10.dp),
-                verticalAlignment = Alignment.CenterVertically
+        LinearProgressIndicator(
+            progress = { progress },
+            modifier = Modifier.fillMaxWidth().height(3.dp),
+            color = secondaryColor,
+            trackColor = NeoInset
+        )
+        Row(
+            Modifier.fillMaxWidth().weight(1f).padding(horizontal = 10.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            SongThumb(song = song, modifier = Modifier.size(46.dp))
+            Spacer(Modifier.width(10.dp))
+            Column(Modifier.weight(1f)) {
+                Text(
+                    song.title,
+                    color = NeoInk,
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 13.sp,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+                Text(
+                    song.artist,
+                    color = MutedLavender,
+                    fontSize = 11.sp,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+            Box(
+                modifier = Modifier
+                    .size(40.dp)
+                    .neuRaised(cornerRadius = 20.dp, depth = 4.dp)
+                    .clickable { onPlayPause() },
+                contentAlignment = Alignment.Center
             ) {
-                SongThumb(song = song, modifier = Modifier.size(44.dp))
-                Spacer(Modifier.width(10.dp))
-                Column(Modifier.weight(1f)) {
-                    Text(song.title, color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                    Text(song.artist, color = MutedLavender, fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                }
-                IconButton(onClick = onPlayPause) {
-                    Icon(
-                        if (isPlaying) Icons.Default.PauseCircleFilled else Icons.Default.PlayCircleFilled,
-                        contentDescription = "Play/Pause",
-                        tint = secondaryColor,
-                        modifier = Modifier.size(34.dp)
-                    )
-                }
-                IconButton(onClick = onNext) {
-                    Icon(Icons.Default.SkipNext, contentDescription = "Next", tint = Color.White, modifier = Modifier.size(26.dp))
-                }
+                Icon(
+                    if (isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
+                    contentDescription = "Play/Pause",
+                    tint = secondaryColor,
+                    modifier = Modifier.size(22.dp)
+                )
+            }
+            Spacer(Modifier.width(6.dp))
+            Box(
+                modifier = Modifier
+                    .size(36.dp)
+                    .clickable { onNext() },
+                contentAlignment = Alignment.Center
+            ) {
+                Icon(Icons.Default.SkipNext, contentDescription = "Next", tint = NeoInk, modifier = Modifier.size(24.dp))
             }
         }
     }
@@ -534,50 +634,52 @@ fun FloatingBottomNavBar(
     onSelect: (MainTab) -> Unit,
     modifier: Modifier = Modifier
 ) {
-    Surface(
-        modifier = modifier.fillMaxWidth().height(64.dp),
-        shape = RoundedCornerShape(32.dp),
-        color = LiquidGlassBackground,
-        border = BorderStroke(1.5.dp, LiquidGlassBorder)
+    // Liquid-glass navigation bar: frosted white, blue gradient edge, blue glow, blue gradient pill for the active tab.
+    val barShape = RoundedCornerShape(32.dp)
+    val pillShape = RoundedCornerShape(22.dp)
+    Row(
+        modifier = modifier
+            .fillMaxWidth()
+            .height(68.dp)
+            .shadow(16.dp, barShape, ambientColor = GlassGlow, spotColor = GlassGlow)
+            .clip(barShape)
+            .background(Brush.verticalGradient(listOf(Color(0xE6FFFFFF), Color(0xB8D6ECFF))))
+            .border(1.2.dp, Brush.linearGradient(listOf(GlassBlueA, GlassFrost, GlassBlueB)), barShape)
+            .padding(horizontal = 6.dp),
+        horizontalArrangement = Arrangement.SpaceAround,
+        verticalAlignment = Alignment.CenterVertically
     ) {
-        Row(
-            modifier = Modifier.fillMaxSize().padding(horizontal = 6.dp),
-            horizontalArrangement = Arrangement.SpaceAround,
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            MainTab.entries.forEach { tab ->
-                val selected = currentTab == tab
-                val animScale by animateFloatAsState(
-                    targetValue = if (selected) 1.15f else 1f,
-                    animationSpec = spring(dampingRatio = Spring.DampingRatioMediumBouncy, stiffness = Spring.StiffnessLow),
-                    label = "tab_scale"
-                )
-                BouncyButton(
-                    onClick = { onSelect(tab) },
-                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 4.dp)
+        MainTab.entries.forEach { tab ->
+            val selected = currentTab == tab
+            BouncyButton(
+                onClick = { onSelect(tab) },
+                modifier = Modifier
+                    .weight(1f)
+                    .padding(vertical = 5.dp)
+            ) {
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    modifier = Modifier
+                        .then(
+                            if (selected) {
+                                Modifier
+                                    .shadow(12.dp, pillShape, ambientColor = GlassGlow, spotColor = GlassGlow)
+                                    .clip(pillShape)
+                                    .background(Brush.linearGradient(listOf(GlassBlueA, GlassBlueB, GlassBlueC)))
+                            } else Modifier
+                        )
+                        .padding(horizontal = 10.dp, vertical = 4.dp)
                 ) {
-                    Column(
-                        horizontalAlignment = Alignment.CenterHorizontally,
-                        modifier = Modifier.graphicsLayer {
-                            scaleX = animScale
-                            scaleY = animScale
-                        }
-                    ) {
-                        Icon(
-                            tab.icon,
-                            contentDescription = tab.label,
-                            tint = if (selected) Color.White else MutedLavender.copy(alpha = 0.6f),
-                            modifier = Modifier.size(22.dp)
-                        )
-                        Text(
-                            tab.label,
-                            color = if (selected) Color.White else MutedLavender.copy(alpha = 0.6f),
-                            fontSize = 9.sp,
-                            maxLines = 1,
-                            softWrap = false,
-                            fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal
-                        )
-                    }
+                    val tint = if (selected) Color.White else NeoMuted
+                    Icon(tab.icon, contentDescription = tab.label, tint = tint, modifier = Modifier.size(22.dp))
+                    Text(
+                        tab.label,
+                        color = tint,
+                        fontSize = 9.sp,
+                        maxLines = 1,
+                        softWrap = false,
+                        fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal
+                    )
                 }
             }
         }
@@ -587,8 +689,10 @@ fun FloatingBottomNavBar(
 @Composable
 fun LiquidWaterWaveBackground(
     isPlaying: Boolean,
-    primaryColor: Color,
-    secondaryColor: Color,
+    primaryColor: Color = NeonPurple,
+    secondaryColor: Color = ElectricCyan,
+    pitch: Float = 0f,
+    roll: Float = 0f,
     modifier: Modifier = Modifier
 ) {
     val infiniteTransition = rememberInfiniteTransition(label = "water_caustics")
@@ -602,18 +706,29 @@ fun LiquidWaterWaveBackground(
         animationSpec = infiniteRepeatable(tween(if (isPlaying) 8500 else 16000, easing = LinearEasing), RepeatMode.Restart),
         label = "wave2"
     )
+    val animPrimary by animateColorAsState(primaryColor, tween(1200), label = "bgPrimary")
+    val animSecondary by animateColorAsState(secondaryColor, tween(1200), label = "bgSecondary")
+    val glowPulse by infiniteTransition.animateFloat(
+        initialValue = 0.6f,
+        targetValue = 1f,
+        animationSpec = infiniteRepeatable(tween(if (isPlaying) 1800 else 4200, easing = FastOutSlowInEasing), RepeatMode.Reverse),
+        label = "bgPulse"
+    )
+    // Soft mint background with drifting light and colour blobs that shift with the artwork palette.
     Canvas(modifier = modifier.fillMaxSize()) {
         val w = size.width
         val h = size.height
-        drawRect(OLEDBlack)
-        val x1 = w * (0.65f + 0.18f * cos(t1.toDouble()).toFloat())
-        val y1 = h * (0.28f + 0.14f * sin(t2.toDouble()).toFloat())
+        drawRect(NeoBg)
+        val gyroShiftX = roll * 20.dp.toPx()
+        val gyroShiftY = pitch * 20.dp.toPx()
+        val x1 = w * (0.65f + 0.18f * cos(t1.toDouble()).toFloat()) + gyroShiftX
+        val y1 = h * (0.28f + 0.14f * sin(t2.toDouble()).toFloat()) + gyroShiftY
         val r1 = w * 0.85f
         drawCircle(
             brush = Brush.radialGradient(
                 colors = listOf(
-                    primaryColor.copy(alpha = if (isPlaying) 0.35f else 0.22f),
-                    DeepViolet.copy(alpha = if (isPlaying) 0.20f else 0.10f),
+                    NeoLight.copy(alpha = if (isPlaying) 0.85f else 0.55f),
+                    NeoLight.copy(alpha = 0.10f),
                     Color.Transparent
                 ),
                 center = Offset(x1, y1),
@@ -622,14 +737,14 @@ fun LiquidWaterWaveBackground(
             radius = r1,
             center = Offset(x1, y1)
         )
-        val x2 = w * (0.32f + 0.16f * sin((t1 * 1.2f).toDouble()).toFloat())
-        val y2 = h * (0.72f + 0.12f * cos((t2 * 0.9f).toDouble()).toFloat())
+        val x2 = w * (0.32f + 0.16f * sin((t1 * 1.2f).toDouble()).toFloat()) - gyroShiftX
+        val y2 = h * (0.72f + 0.12f * cos((t2 * 0.9f).toDouble()).toFloat()) - gyroShiftY
         val r2 = w * 0.90f
         drawCircle(
             brush = Brush.radialGradient(
                 colors = listOf(
-                    secondaryColor.copy(alpha = if (isPlaying) 0.30f else 0.18f),
-                    AquaGlow.copy(alpha = if (isPlaying) 0.15f else 0.08f),
+                    animSecondary.copy(alpha = (if (isPlaying) 0.16f else 0.08f) * glowPulse),
+                    NeoAccentSoft.copy(alpha = 0.04f),
                     Color.Transparent
                 ),
                 center = Offset(x2, y2),
@@ -638,67 +753,128 @@ fun LiquidWaterWaveBackground(
             radius = r2,
             center = Offset(x2, y2)
         )
+        val x3 = w * (0.78f + 0.10f * sin((t2 * 1.1f).toDouble()).toFloat())
+        val y3 = h * (0.90f - 0.08f * cos((t1 * 0.7f).toDouble()).toFloat())
+        val r3 = w * 0.70f
+        drawCircle(
+            brush = Brush.radialGradient(
+                colors = listOf(
+                    animPrimary.copy(alpha = (if (isPlaying) 0.14f else 0.07f) * glowPulse),
+                    Color.Transparent
+                ),
+                center = Offset(x3, y3),
+                radius = r3
+            ),
+            radius = r3,
+            center = Offset(x3, y3)
+        )
     }
 }
 
-// Theme 2: Flat Neumorphic Rounded Player Centerpiece
 @Composable
 fun RoundedRectTimelineCenterpiece(
     song: Song,
     isPlaying: Boolean,
     primaryColor: Color,
     secondaryColor: Color,
+    gyroPitch: Float,
+    gyroRoll: Float,
     modifier: Modifier = Modifier
 ) {
     val amplitudes = RealtimeFftMonitor.amplitudes
     val numBars = 22
+    val infinite = rememberInfiniteTransition(label = "artwork_fx")
+    val sweep by infinite.animateFloat(
+        initialValue = 0f,
+        targetValue = 1f,
+        animationSpec = infiniteRepeatable(tween(3600, easing = LinearEasing), RepeatMode.Restart),
+        label = "art_sweep"
+    )
+    val breathe by infinite.animateFloat(
+        initialValue = 1f,
+        targetValue = 1.02f,
+        animationSpec = infiniteRepeatable(tween(2400, easing = FastOutSlowInEasing), RepeatMode.Reverse),
+        label = "art_breathe"
+    )
+    val accent by animateColorAsState(primaryColor, tween(900), label = "art_accent")
+    val accent2 by animateColorAsState(secondaryColor, tween(900), label = "art_accent2")
 
+    // Upright rounded card with an animated neon rim. No gyroscope rotation, so it never tilts.
     Box(
         modifier = modifier
             .aspectRatio(1f)
-            .shadow(24.dp, RoundedCornerShape(32.dp), ambientColor = NeumorphicShadow, spotColor = NeumorphicShadow)
-            .background(NeumorphicBase, RoundedCornerShape(32.dp))
-            .border(1.5.dp, NeumorphicHighlight, RoundedCornerShape(32.dp)),
+            .neuRaised(cornerRadius = 40.dp, depth = 14.dp),
         contentAlignment = Alignment.Center
     ) {
-        SongThumb(
-            song = song,
+        Box(
             modifier = Modifier
-                .fillMaxSize(0.92f)
-                .clip(RoundedCornerShape(26.dp))
-        )
-
-        Canvas(modifier = Modifier.fillMaxSize(0.92f)) {
-            val w = size.width
-            val h = size.height
-            val corner = 26.dp.toPx()
-
-            drawRoundRect(
-                brush = Brush.verticalGradient(
-                    0.58f to Color.Transparent,
-                    1.0f to Color(0xDD0B071A)
-                ),
-                size = size,
-                cornerRadius = CornerRadius(corner, corner)
-            )
-
-            val barWidth = 4.dp.toPx()
-            val totalBarsWidth = numBars * barWidth
-            val spacing = (w * 0.78f - totalBarsWidth) / (numBars - 1).coerceAtLeast(1)
-            val startX = (w * 0.11f)
-            val bottomY = h - 18.dp.toPx()
-
-            for (i in 0 until numBars) {
-                val amp = if (isPlaying) amplitudes[i % amplitudes.size] else 0.08f
-                val barHeight = (44.dp.toPx() * amp).coerceIn(4.dp.toPx(), 40.dp.toPx())
-                val bx = startX + i * (barWidth + spacing)
-
-                drawRoundRect(
-                    brush = Brush.verticalGradient(listOf(secondaryColor, primaryColor)),
-                    topLeft = Offset(bx, bottomY - barHeight),
-                    size = Size(barWidth, barHeight),
-                    cornerRadius = CornerRadius(2.dp.toPx(), 2.dp.toPx())
+                .fillMaxSize(0.94f)
+                .clip(RoundedCornerShape(36.dp))
+                .background(
+                    Brush.linearGradient(
+                        colors = listOf(accent, GlassBlueA, accent2, GlassBlueB, accent),
+                        start = Offset(sweep * 900f - 450f, 0f),
+                        end = Offset(sweep * 900f + 450f, 900f)
+                    )
                 )
+                .padding(3.dp)
+        ) {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .clip(RoundedCornerShape(33.dp))
+                    .background(NeoBg)
+            ) {
+                SongThumb(
+                    song = song,
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .graphicsLayer { scaleX = breathe; scaleY = breathe }
+                )
+                Canvas(modifier = Modifier.fillMaxSize()) {
+                    val w = size.width
+                    val h = size.height
+                    // Glass gloss across the top.
+                    drawRect(
+                        brush = Brush.verticalGradient(
+                            0f to Color.White.copy(alpha = 0.28f),
+                            0.45f to Color.Transparent
+                        ),
+                        size = Size(w, h * 0.5f)
+                    )
+                    // Moving light sheen.
+                    drawRect(
+                        brush = Brush.linearGradient(
+                            0f to Color.Transparent,
+                            0.5f to Color.White.copy(alpha = 0.18f),
+                            1f to Color.Transparent,
+                            start = Offset(sweep * w * 2f - w, 0f),
+                            end = Offset(sweep * w * 2f, h)
+                        )
+                    )
+                    // Dark base for the visualiser.
+                    drawRect(
+                        brush = Brush.verticalGradient(
+                            0.55f to Color.Transparent,
+                            1.0f to Color(0xD9102A3A)
+                        )
+                    )
+                    val barWidth = 4.dp.toPx()
+                    val spacing = (w * 0.78f - numBars * barWidth) / (numBars - 1).coerceAtLeast(1)
+                    val startX = w * 0.11f
+                    val bottomY = h - 16.dp.toPx()
+                    for (i in 0 until numBars) {
+                        val amp = if (isPlaying) amplitudes[i % amplitudes.size] else 0.08f
+                        val barHeight = (44.dp.toPx() * amp).coerceIn(4.dp.toPx(), 40.dp.toPx())
+                        val bx = startX + i * (barWidth + spacing)
+                        drawRoundRect(
+                            brush = Brush.verticalGradient(listOf(accent, GlassBlueA)),
+                            topLeft = Offset(bx, bottomY - barHeight),
+                            size = Size(barWidth, barHeight),
+                            cornerRadius = CornerRadius(2.dp.toPx(), 2.dp.toPx())
+                        )
+                    }
+                }
             }
         }
     }
@@ -762,7 +938,7 @@ fun WaveformSeekScrubber(
             val activeX = w * progress
 
             drawLine(
-                color = Color(0x352B194E),
+                color = NeoInset,
                 start = Offset(activeX, midY),
                 end = Offset(w, midY),
                 strokeWidth = 3.5.dp.toPx(),
@@ -820,7 +996,7 @@ fun WaveformSeekScrubber(
                 )
 
                 drawCircle(
-                    color = Color.White,
+                    color = NeoInk,
                     radius = 5.dp.toPx(),
                     center = headCenter
                 )
@@ -834,77 +1010,103 @@ fun WaveformSeekScrubber(
     }
 }
 
+private const val LINE_GRACE_MS = 1500L
+
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 fun LiveSyncedKaraokeLyrics(
     lyrics: List<LyricLine>,
+    isSynced: Boolean,
     positionMs: Long,
+    durationMs: Long,
     activeColor: Color,
     onSeek: (Long) -> Unit,
     modifier: Modifier = Modifier
 ) {
     val listState = rememberLazyListState()
-    val activeLineIdx = remember(positionMs, lyrics) {
-        lyrics.indexOfLast { it.timestampMs <= positionMs }.coerceAtLeast(0)
-    }
 
-    LaunchedEffect(activeLineIdx) {
-        if (lyrics.isNotEmpty()) {
-            listState.animateScrollToItem((activeLineIdx - 2).coerceAtLeast(0))
+    // -1 means nothing is being sung: before the first line, after the last line ends,
+    // after the track finishes, or when the lyrics have no timing. The highlight never sticks.
+    val activeLineIdx = remember(positionMs, durationMs, lyrics, isSynced) {
+        when {
+            !isSynced || lyrics.isEmpty() -> -1
+            durationMs > 0 && positionMs >= durationMs -> -1
+            else -> {
+                var idx = -1
+                for (i in lyrics.indices) {
+                    if (lyrics[i].timestampMs <= positionMs) idx = i else break
+                }
+                if (idx >= 0 && positionMs > lyrics[idx].endMs + LINE_GRACE_MS) -1 else idx
+            }
         }
     }
 
-    LazyColumn(state = listState, modifier = modifier.fillMaxSize()) {
-        itemsIndexed(lyrics) { idx, line ->
-            val isCurrentLine = idx == activeLineIdx
+    LaunchedEffect(activeLineIdx) {
+        if (activeLineIdx >= 0) {
+            listState.animateScrollToItem(maxOf(0, activeLineIdx - 2))
+        }
+    }
 
+    LazyColumn(
+        state = listState,
+        modifier = modifier.fillMaxSize(),
+        contentPadding = PaddingValues(vertical = 36.dp)
+    ) {
+        itemsIndexed(lyrics) { idx, line ->
+            val isActive = idx == activeLineIdx
+            val canSeek = isSynced && line.timestampMs >= 0L
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(vertical = 10.dp)
-                    .clickable { onSeek(line.timestampMs) },
+                    .padding(vertical = 9.dp)
+                    .then(if (canSeek) Modifier.clickable { onSeek(line.timestampMs) } else Modifier),
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
-                if (!isCurrentLine || line.words.isEmpty()) {
+                if (!isActive || line.words.isEmpty()) {
                     Text(
                         text = line.text,
-                        color = if (isCurrentLine) activeColor else MutedLavender.copy(alpha = 0.40f),
-                        fontSize = if (isCurrentLine) 21.sp else 15.sp,
-                        fontWeight = if (isCurrentLine) FontWeight.Black else FontWeight.Normal,
-                        textAlign = TextAlign.Center
+                        color = if (isActive) NeoInk else NeoMuted.copy(alpha = 0.6f),
+                        fontSize = if (isActive) 21.sp else 16.sp,
+                        fontWeight = if (isActive) FontWeight.Black else FontWeight.Medium,
+                        textAlign = TextAlign.Center,
+                        modifier = Modifier.fillMaxWidth()
                     )
                 } else {
-                    Row(
+                    // The word being sung is the last word whose start time has passed.
+                    val currentWord = line.words.indexOfLast { positionMs >= it.startMs }
+                    FlowRow(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.Center,
-                        verticalAlignment = Alignment.CenterVertically
+                        verticalArrangement = Arrangement.Center
                     ) {
-                        line.words.forEach { word ->
-                            val isWordSung = positionMs >= word.startMs
-                            val isWordActive = positionMs in word.startMs..word.endMs
-
-                            val wordColor = when {
-                                isWordActive -> Color.White
-                                isWordSung -> activeColor
-                                else -> MutedLavender.copy(alpha = 0.45f)
-                            }
-
+                        line.words.forEachIndexed { wIdx, word ->
+                            val isCurrent = wIdx == currentWord
+                            val isSung = wIdx < currentWord
                             val wordScale by animateFloatAsState(
-                                targetValue = if (isWordActive) 1.15f else 1.0f,
-                                animationSpec = spring(stiffness = Spring.StiffnessHigh),
-                                label = "word_glow"
+                                targetValue = if (isCurrent) 1.12f else 1f,
+                                animationSpec = spring(
+                                    dampingRatio = Spring.DampingRatioMediumBouncy,
+                                    stiffness = Spring.StiffnessMediumLow
+                                ),
+                                label = "word_scale"
                             )
-
                             Text(
-                                text = "${word.text} ",
-                                color = wordColor,
-                                fontSize = 21.sp,
-                                fontWeight = if (isWordSung) FontWeight.Black else FontWeight.Bold,
+                                text = word.text + " ",
+                                color = when {
+                                    isCurrent -> activeColor
+                                    isSung -> NeoInk
+                                    else -> NeoMuted.copy(alpha = 0.6f)
+                                },
+                                fontSize = 22.sp,
+                                fontWeight = if (isCurrent) FontWeight.Black else FontWeight.Bold,
+                                style = TextStyle(
+                                    shadow = if (isCurrent) {
+                                        Shadow(color = NeonGlow, offset = Offset.Zero, blurRadius = 26f)
+                                    } else null
+                                ),
                                 modifier = Modifier.graphicsLayer {
                                     scaleX = wordScale
                                     scaleY = wordScale
-                                    if (isWordActive) {
-                                        shadowElevation = 18f
-                                    }
                                 }
                             )
                         }
@@ -932,12 +1134,12 @@ fun TagEditorAndFingerprintDialog(
 
     AlertDialog(
         onDismissRequest = onDismiss,
-        containerColor = Color(0xFF1E1436),
+        containerColor = NeoDialog,
         title = {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Icon(Icons.Default.AutoFixHigh, null, tint = ElectricCyan)
                 Spacer(Modifier.width(8.dp))
-                Text("Fingerprint & Metadata Fixer", color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                Text("Fingerprint & Metadata Fixer", color = NeoInk, fontSize = 16.sp, fontWeight = FontWeight.Bold)
             }
         },
         text = {
@@ -946,22 +1148,19 @@ fun TagEditorAndFingerprintDialog(
                     value = title,
                     onValueChange = { title = it },
                     label = { Text("Track Title", color = MutedLavender) },
-                    textStyle = TextStyle(color = Color.White, fontSize = 15.sp),
-                    colors = OutlinedTextFieldDefaults.colors(focusedTextColor = Color.White, unfocusedTextColor = Color.White)
+                    colors = OutlinedTextFieldDefaults.colors(focusedTextColor = NeoInk, unfocusedTextColor = NeoInk)
                 )
                 OutlinedTextField(
                     value = artist,
                     onValueChange = { artist = it },
                     label = { Text("Artist", color = MutedLavender) },
-                    textStyle = TextStyle(color = Color.White, fontSize = 15.sp),
-                    colors = OutlinedTextFieldDefaults.colors(focusedTextColor = Color.White, unfocusedTextColor = Color.White)
+                    colors = OutlinedTextFieldDefaults.colors(focusedTextColor = NeoInk, unfocusedTextColor = NeoInk)
                 )
                 OutlinedTextField(
                     value = album,
                     onValueChange = { album = it },
                     label = { Text("Album", color = MutedLavender) },
-                    textStyle = TextStyle(color = Color.White, fontSize = 15.sp),
-                    colors = OutlinedTextFieldDefaults.colors(focusedTextColor = Color.White, unfocusedTextColor = Color.White)
+                    colors = OutlinedTextFieldDefaults.colors(focusedTextColor = NeoInk, unfocusedTextColor = NeoInk)
                 )
                 Button(
                     onClick = {
@@ -1005,6 +1204,202 @@ fun TagEditorAndFingerprintDialog(
 }
 
 @Composable
+fun DeepOceanLockScreenView(
+    song: Song,
+    isPlaying: Boolean,
+    position: Long,
+    duration: Long,
+    shuffle: Boolean,
+    repeatMode: Int,
+    gyroPitch: Float,
+    gyroRoll: Float,
+    onPlayPause: () -> Unit,
+    onNext: () -> Unit,
+    onPrevious: () -> Unit,
+    onSeek: (Long) -> Unit,
+    onShuffle: () -> Unit,
+    onRepeat: () -> Unit,
+    onCloseLockScreen: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val infiniteTransition = rememberInfiniteTransition(label = "ocean_underwater")
+    val waveT1 by infiniteTransition.animateFloat(
+        initialValue = 0f, targetValue = 2f * PI.toFloat(),
+        animationSpec = infiniteRepeatable(tween(8000, easing = LinearEasing), RepeatMode.Restart),
+        label = "ocean_wave1"
+    )
+
+    Box(
+        modifier = modifier
+            .fillMaxSize()
+            .background(DeepOceanAbyss)
+    ) {
+        Canvas(modifier = Modifier.fillMaxSize()) {
+            val w = size.width
+            val h = size.height
+
+            drawRect(
+                brush = Brush.verticalGradient(
+                    colors = listOf(DeepOceanAbyss, OceanNavyDeep, DeepOceanAbyss)
+                )
+            )
+
+            val bloomX = w * (0.5f + 0.12f * sin(waveT1.toDouble()).toFloat()) + (gyroRoll * 30f)
+            val bloomY = h * (0.35f + 0.08f * cos(waveT1.toDouble()).toFloat()) + (gyroPitch * 30f)
+            drawCircle(
+                brush = Brush.radialGradient(
+                    colors = listOf(
+                        BioluminescentCyan.copy(alpha = if (isPlaying) 0.32f else 0.18f),
+                        OceanNavyDeep.copy(alpha = 0.25f),
+                        Color.Transparent
+                    ),
+                    center = Offset(bloomX, bloomY),
+                    radius = w * 0.75f
+                ),
+                radius = w * 0.75f,
+                center = Offset(bloomX, bloomY)
+            )
+        }
+
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .statusBarsPadding()
+                .navigationBarsPadding()
+                .padding(horizontal = 24.dp, vertical = 16.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Surface(
+                    color = OceanMistGlass,
+                    shape = RoundedCornerShape(20.dp),
+                    border = BorderStroke(1.dp, OceanGlassBorder)
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(Icons.Default.Lock, null, tint = BioluminescentCyan, modifier = Modifier.size(14.dp))
+                        Spacer(Modifier.width(6.dp))
+                        Text("DEEP OCEAN #18", color = NeoInk, fontSize = 11.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.sp)
+                    }
+                }
+
+                BouncyIconButton(onClick = onCloseLockScreen, size = 36.dp) {
+                    Icon(Icons.Default.LockOpen, "Unlock", tint = BioluminescentCyan, modifier = Modifier.size(20.dp))
+                }
+            }
+
+            Spacer(Modifier.weight(0.6f))
+
+            RoundedRectTimelineCenterpiece(
+                song = song,
+                isPlaying = isPlaying,
+                primaryColor = OceanNavyDeep,
+                secondaryColor = BioluminescentCyan,
+                gyroPitch = gyroPitch,
+                gyroRoll = gyroRoll,
+                modifier = Modifier.size(240.dp)
+            )
+
+            Spacer(Modifier.height(24.dp))
+
+            Text(
+                song.title,
+                color = NeoInk,
+                fontSize = 22.sp,
+                fontWeight = FontWeight.Black,
+                textAlign = TextAlign.Center,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.fillMaxWidth()
+            )
+            Spacer(Modifier.height(4.dp))
+            Text(
+                "${song.artist} • ${song.album}",
+                color = MutedLavender.copy(alpha = 0.85f),
+                fontSize = 13.sp,
+                textAlign = TextAlign.Center,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.fillMaxWidth()
+            )
+
+            Spacer(Modifier.weight(0.8f))
+
+            WaveformSeekScrubber(
+                position = position,
+                duration = duration,
+                isPlaying = isPlaying,
+                primaryColor = OceanNavyDeep,
+                secondaryColor = BioluminescentCyan,
+                onSeek = onSeek
+            )
+
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                Text(timeText(position), color = MutedLavender, fontSize = 11.sp)
+                Text(timeText(duration), color = MutedLavender, fontSize = 11.sp)
+            }
+
+            Spacer(Modifier.height(16.dp))
+
+            Surface(
+                color = OceanMistGlass,
+                shape = RoundedCornerShape(32.dp),
+                border = BorderStroke(1.2.dp, OceanGlassBorder),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(vertical = 10.dp),
+                    horizontalArrangement = Arrangement.SpaceEvenly,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    BouncyIconButton(onClick = onShuffle) {
+                        Icon(Icons.Default.Shuffle, null, tint = if (shuffle) BioluminescentCyan else MutedLavender)
+                    }
+                    BouncyIconButton(onClick = onPrevious) {
+                        Icon(Icons.Default.SkipPrevious, null, tint = NeoInk, modifier = Modifier.size(34.dp))
+                    }
+                    BouncyButton(onClick = onPlayPause, modifier = Modifier.size(62.dp)) {
+                        Surface(
+                            shape = CircleShape,
+                            color = BioluminescentCyan,
+                            border = BorderStroke(2.dp, NeoInk),
+                            modifier = Modifier.fillMaxSize()
+                        ) {
+                            Box(contentAlignment = Alignment.Center) {
+                                Icon(
+                                    if (isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
+                                    null,
+                                    tint = DeepOceanAbyss,
+                                    modifier = Modifier.size(34.dp)
+                                )
+                            }
+                        }
+                    }
+                    BouncyIconButton(onClick = onNext) {
+                        Icon(Icons.Default.SkipNext, null, tint = NeoInk, modifier = Modifier.size(34.dp))
+                    }
+                    BouncyIconButton(onClick = onRepeat) {
+                        Icon(
+                            if (repeatMode == Player.REPEAT_MODE_ONE) Icons.Default.RepeatOne else Icons.Default.Repeat,
+                            null,
+                            tint = if (repeatMode != Player.REPEAT_MODE_OFF) BioluminescentCyan else MutedLavender
+                        )
+                    }
+                }
+            }
+
+            Spacer(Modifier.height(12.dp))
+        }
+    }
+}
+
+@Composable
 fun FullPlayer(
     song: Song,
     isPlaying: Boolean,
@@ -1021,7 +1416,10 @@ fun FullPlayer(
     isFavorite: Boolean,
     primaryAccent: Color,
     secondaryAccent: Color,
+    gyroPitch: Float,
+    gyroRoll: Float,
     onClose: () -> Unit,
+    onOpenLockScreen: () -> Unit,
     onPlayPause: () -> Unit,
     onNext: () -> Unit,
     onPrevious: () -> Unit,
@@ -1034,12 +1432,12 @@ fun FullPlayer(
 ) {
     val context = LocalContext.current
     var showLyrics by remember { mutableStateOf(false) }
-    var lyrics by remember { mutableStateOf<List<LyricLine>>(emptyList()) }
+    var lyricsResult by remember { mutableStateOf(LyricsResult.NONE) }
     var isLoadingLyrics by remember { mutableStateOf(false) }
 
-    LaunchedEffect(song.id, song.title) {
+    LaunchedEffect(song.id, song.title, song.artist, song.durationMs) {
         isLoadingLyrics = true
-        lyrics = LyricsEngine.loadLyricsForSong(context, song)
+        lyricsResult = LyricsEngine.loadLyricsForSong(context, song)
         isLoadingLyrics = false
     }
 
@@ -1051,7 +1449,9 @@ fun FullPlayer(
         LiquidWaterWaveBackground(
             isPlaying = isPlaying,
             primaryColor = primaryAccent,
-            secondaryColor = secondaryAccent
+            secondaryColor = secondaryAccent,
+            pitch = gyroPitch,
+            roll = gyroRoll
         )
         Column(
             Modifier
@@ -1069,6 +1469,7 @@ fun FullPlayer(
             )
             Spacer(Modifier.height(6.dp))
 
+            // Navigation Bar
             Row(
                 Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically,
@@ -1076,7 +1477,7 @@ fun FullPlayer(
             ) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     BouncyIconButton(onClick = onClose, size = 38.dp) {
-                        Icon(Icons.Default.KeyboardArrowDown, null, tint = Color.White, modifier = Modifier.size(26.dp))
+                        Icon(Icons.Default.KeyboardArrowDown, null, tint = NeoInk, modifier = Modifier.size(26.dp))
                     }
                     Text(
                         "NOW PLAYING",
@@ -1089,6 +1490,9 @@ fun FullPlayer(
                     )
                 }
                 Row(verticalAlignment = Alignment.CenterVertically) {
+                    BouncyIconButton(onClick = onOpenLockScreen, size = 36.dp) {
+                        Icon(Icons.Default.Lock, "Lock Screen", tint = BioluminescentCyan, modifier = Modifier.size(20.dp))
+                    }
                     BouncyIconButton(onClick = onLaunchParty, size = 36.dp) {
                         Icon(Icons.Default.Headphones, "Party", tint = secondaryAccent, modifier = Modifier.size(20.dp))
                     }
@@ -1114,8 +1518,8 @@ fun FullPlayer(
                     val isSel = speedMode == mode
                     Surface(
                         shape = RoundedCornerShape(14.dp),
-                        color = if (isSel) secondaryAccent.copy(alpha = 0.22f) else Color(0x2218102C),
-                        border = BorderStroke(1.dp, if (isSel) secondaryAccent else Color(0x33C7BCE0)),
+                        color = if (isSel) secondaryAccent.copy(alpha = 0.22f) else NeoInset,
+                        border = BorderStroke(1.dp, if (isSel) secondaryAccent else NeoEdge),
                         modifier = Modifier
                             .height(32.dp)
                             .clickable { onSpeedModeChange(mode) }
@@ -1141,7 +1545,7 @@ fun FullPlayer(
             AnimatedVisibility(visible = speedMode == "Slowed") {
                 Surface(
                     shape = RoundedCornerShape(16.dp),
-                    color = Color(0x6618102C),
+                    color = NeoInset,
                     border = BorderStroke(1.dp, GlassBorder),
                     modifier = Modifier.fillMaxWidth().padding(top = 8.dp)
                 ) {
@@ -1151,7 +1555,7 @@ fun FullPlayer(
                             verticalAlignment = Alignment.CenterVertically,
                             horizontalArrangement = Arrangement.SpaceBetween
                         ) {
-                            Text("Slowed Speed", color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
+                            Text("Slowed Speed", color = NeoInk, fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
                             Row(verticalAlignment = Alignment.CenterVertically) {
                                 IconButton(
                                     onClick = { onSlowedSpeedChange((slowedSpeedFactor - 0.05f).coerceIn(0.60f, 0.95f)) },
@@ -1189,7 +1593,7 @@ fun FullPlayer(
                             verticalAlignment = Alignment.CenterVertically,
                             horizontalArrangement = Arrangement.SpaceBetween
                         ) {
-                            Text("Reverb Level", color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
+                            Text("Reverb Level", color = NeoInk, fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
                             Row(verticalAlignment = Alignment.CenterVertically) {
                                 IconButton(
                                     onClick = { onReverbStrengthChange((reverbStrengthFactor - 0.10f).coerceIn(0f, 1f)) },
@@ -1226,35 +1630,51 @@ fun FullPlayer(
             Spacer(Modifier.height(6.dp))
 
             if (showLyrics) {
-                Box(
-                    modifier = Modifier
-                        .weight(1f)
-                        .fillMaxWidth()
-                        .clip(RoundedCornerShape(26.dp))
-                        .background(Color(0x6618102C))
-                        .border(1.5.dp, GlassBorder, RoundedCornerShape(26.dp))
-                        .padding(18.dp)
-                ) {
-                    if (isLoadingLyrics) {
-                        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                            CircularProgressIndicator(color = secondaryAccent)
-                        }
-                    } else if (lyrics.isEmpty()) {
-                        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                            Text(
-                                "No synchronized lyrics found for '${song.title}'.\nAuto-fix the song title to match online databases.",
+                Column(Modifier.weight(1f).fillMaxWidth()) {
+                    if (!isLoadingLyrics && lyricsResult.lines.isNotEmpty()) {
+                        Text(
+                            text = buildString {
+                                append(lyricsResult.language.ifBlank { "Lyrics" })
+                                append(if (lyricsResult.synced) " • time-synced" else " • not time-synced")
+                                if (lyricsResult.matchLabel.isNotBlank()) append(" • ${lyricsResult.matchLabel}")
+                            },
+                            color = MutedLavender,
+                            fontSize = 11.sp,
+                            textAlign = TextAlign.Center,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.fillMaxWidth().padding(bottom = 6.dp)
+                        )
+                    }
+                    Box(
+                        modifier = Modifier
+                            .weight(1f)
+                            .fillMaxWidth()
+                            .neuInset(cornerRadius = 26.dp)
+                            .padding(18.dp)
+                    ) {
+                        when {
+                            isLoadingLyrics -> CircularProgressIndicator(
+                                color = secondaryAccent,
+                                modifier = Modifier.align(Alignment.Center)
+                            )
+                            lyricsResult.lines.isEmpty() -> Text(
+                                "No lyrics found for '${song.title}'.\nUse the Auto-Fix (✨) on this song to correct its title and artist, then reopen the lyrics.",
                                 color = MutedLavender,
                                 fontSize = 13.sp,
-                                textAlign = TextAlign.Center
+                                textAlign = TextAlign.Center,
+                                modifier = Modifier.align(Alignment.Center)
+                            )
+                            else -> LiveSyncedKaraokeLyrics(
+                                lyrics = lyricsResult.lines,
+                                isSynced = lyricsResult.synced,
+                                positionMs = position,
+                                durationMs = duration,
+                                activeColor = NeonBlue,
+                                onSeek = onSeek,
+                                modifier = Modifier.fillMaxSize()
                             )
                         }
-                    } else {
-                        LiveSyncedKaraokeLyrics(
-                            lyrics = lyrics,
-                            positionMs = position,
-                            activeColor = secondaryAccent,
-                            onSeek = onSeek
-                        )
                     }
                 }
             } else {
@@ -1267,11 +1687,12 @@ fun FullPlayer(
                         isPlaying = isPlaying,
                         primaryColor = primaryAccent,
                         secondaryColor = secondaryAccent,
-                        modifier = Modifier.size(220.dp)
+                        gyroPitch = gyroPitch,
+                        gyroRoll = gyroRoll,
+                        modifier = Modifier.size(230.dp)
                     )
                 }
             }
-
             Spacer(Modifier.height(6.dp))
 
             Row(
@@ -1279,14 +1700,14 @@ fun FullPlayer(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Column(Modifier.weight(1f)) {
-                    Text(song.title, color = Color.White, fontSize = 19.sp, fontWeight = FontWeight.Black, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    Text(song.title, color = NeoInk, fontSize = 19.sp, fontWeight = FontWeight.Black, maxLines = 1, overflow = TextOverflow.Ellipsis)
                     Text("${song.artist} • ${song.album}", color = MutedLavender, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
                 }
                 IconButton(onClick = onToggleFavorite) {
                     Icon(
                         if (isFavorite) Icons.Default.Favorite else Icons.Default.FavoriteBorder,
                         contentDescription = "Favorite",
-                        tint = if (isFavorite) Color(0xFFFF5286) else MutedLavender
+                        tint = if (isFavorite) NeoDanger else MutedLavender
                     )
                 }
             }
@@ -1316,60 +1737,27 @@ fun FullPlayer(
                 BouncyIconButton(onClick = onShuffle) {
                     Icon(Icons.Default.Shuffle, null, tint = if (shuffle) secondaryAccent else MutedLavender)
                 }
-
-                // Neumorphic Previous Button
-                BouncyButton(onClick = onPrevious, modifier = Modifier.size(46.dp)) {
-                    Surface(
-                        shape = CircleShape,
-                        color = NeumorphicBase,
-                        border = BorderStroke(1.5.dp, NeumorphicHighlight),
+                BouncyIconButton(onClick = onPrevious) {
+                    Icon(Icons.Default.SkipPrevious, null, tint = NeoInk, modifier = Modifier.size(36.dp))
+                }
+                BouncyButton(onClick = onPlayPause, modifier = Modifier.size(70.dp)) {
+                    Box(
                         modifier = Modifier
                             .fillMaxSize()
-                            .shadow(8.dp, CircleShape, ambientColor = NeumorphicShadow, spotColor = NeumorphicShadow)
+                            .neuRaised(cornerRadius = 35.dp, depth = 9.dp),
+                        contentAlignment = Alignment.Center
                     ) {
-                        Box(contentAlignment = Alignment.Center) {
-                            Icon(Icons.Default.SkipPrevious, null, tint = Color.White, modifier = Modifier.size(24.dp))
-                        }
+                        Icon(
+                            if (isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
+                            null,
+                            tint = secondaryAccent,
+                            modifier = Modifier.size(34.dp)
+                        )
                     }
                 }
-
-                // Neumorphic Play/Pause Button
-                BouncyButton(onClick = onPlayPause, modifier = Modifier.size(72.dp)) {
-                    Surface(
-                        shape = CircleShape,
-                        color = NeumorphicBase,
-                        border = BorderStroke(2.5.dp, NeumorphicHighlight),
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .shadow(14.dp, CircleShape, ambientColor = NeumorphicShadow, spotColor = NeumorphicShadow)
-                    ) {
-                        Box(contentAlignment = Alignment.Center) {
-                            Icon(
-                                if (isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
-                                null,
-                                tint = secondaryAccent,
-                                modifier = Modifier.size(38.dp)
-                            )
-                        }
-                    }
+                BouncyIconButton(onClick = onNext) {
+                    Icon(Icons.Default.SkipNext, null, tint = NeoInk, modifier = Modifier.size(36.dp))
                 }
-
-                // Neumorphic Next Button
-                BouncyButton(onClick = onNext, modifier = Modifier.size(46.dp)) {
-                    Surface(
-                        shape = CircleShape,
-                        color = NeumorphicBase,
-                        border = BorderStroke(1.5.dp, NeumorphicHighlight),
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .shadow(8.dp, CircleShape, ambientColor = NeumorphicShadow, spotColor = NeumorphicShadow)
-                    ) {
-                        Box(contentAlignment = Alignment.Center) {
-                            Icon(Icons.Default.SkipNext, null, tint = Color.White, modifier = Modifier.size(24.dp))
-                        }
-                    }
-                }
-
                 BouncyIconButton(onClick = onRepeat) {
                     Icon(
                         if (repeatMode == Player.REPEAT_MODE_ONE) Icons.Default.RepeatOne else Icons.Default.Repeat,
@@ -1399,6 +1787,7 @@ fun SoniqApp() {
     var shuffle by remember { mutableStateOf(false) }
     var repeatMode by remember { mutableIntStateOf(Player.REPEAT_MODE_OFF) }
     var showPlayer by remember { mutableStateOf(false) }
+    var showDeepOceanLockScreen by remember { mutableStateOf(false) }
 
     var dynamicPrimaryColor by remember { mutableStateOf(NeonPurple) }
     var dynamicSecondaryColor by remember { mutableStateOf(ElectricCyan) }
@@ -1436,13 +1825,20 @@ fun SoniqApp() {
     val listState = rememberLazyListState()
     var selectedFilterKey by remember { mutableStateOf<String?>(null) }
     var playerOffsetY by remember { mutableFloatStateOf(0f) }
+    val gyroEngine = remember { GyroscopeParallaxEngine(context) }
 
     var currentSpeedMode by remember { mutableStateOf("Normal") }
     var slowedSpeedFactor by remember { mutableFloatStateOf(0.85f) }
     var reverbStrengthFactor by remember { mutableFloatStateOf(0.70f) }
 
-    BackHandler(enabled = showPlayer || selectedFilterKey != null || currentTab != MainTab.HOME) {
+    DisposableEffect(Unit) {
+        gyroEngine.start()
+        onDispose { gyroEngine.stop() }
+    }
+
+    BackHandler(enabled = showDeepOceanLockScreen || showPlayer || selectedFilterKey != null || currentTab != MainTab.HOME) {
         when {
+            showDeepOceanLockScreen -> showDeepOceanLockScreen = false
             showPlayer -> showPlayer = false
             selectedFilterKey != null -> selectedFilterKey = null
             currentTab != MainTab.HOME -> currentTab = MainTab.HOME
@@ -1481,22 +1877,45 @@ fun SoniqApp() {
         if (openFullPlayer) showPlayer = true
     }
 
+    fun skipTrack(forward: Boolean) {
+        val c = controller ?: return
+        // After an error the player sits idle; re-prepare it so the skip is not ignored.
+        if (c.playerError != null || c.playbackState == Player.STATE_IDLE) {
+            c.prepare()
+        }
+        if (forward) {
+            when {
+                c.hasNextMediaItem() -> c.seekToNextMediaItem()
+                c.repeatMode == Player.REPEAT_MODE_ALL -> c.seekToDefaultPosition(0)
+                else -> return
+            }
+        } else {
+            // Like most players: a previous tap in the first 3 seconds goes to the previous track.
+            if (c.currentPosition > 3000L || !c.hasPreviousMediaItem()) c.seekTo(0L)
+            else c.seekToPreviousMediaItem()
+        }
+        c.play()
+    }
+
     fun triggerBatchFix() {
         if (isBatchFixing) return
-        val unknownList = songs.filter { AudioFingerprintFixer.isSongUnknown(it) }
-        if (unknownList.isEmpty()) {
+        val autoIds = prefs.getStringSet("auto_fixed_ids", emptySet())?.toSet() ?: emptySet()
+        // Unknown tracks, plus tracks whose earlier auto-fix is re-verified this time.
+        val targets = songs.filter { AudioFingerprintFixer.isSongUnknown(it) || it.id.toString() in autoIds }
+        if (targets.isEmpty()) {
             batchSummary = "All tracks in your library are already identified!"
             return
         }
 
         scope.launch {
             isBatchFixing = true
-            batchTotal = unknownList.size
+            batchTotal = targets.size
             batchCurrent = 0
+            val revertIds = mutableSetOf<Long>()
 
             val count = AudioFingerprintFixer.batchFixAllUnknown(
                 context = context,
-                songs = songs,
+                songs = targets,
                 onProgress = { cur, tot, name ->
                     batchCurrent = cur
                     batchTotal = tot
@@ -1505,6 +1924,7 @@ fun SoniqApp() {
                 onSongFixed = { song, fix ->
                     val artUri = fix.albumArtUrl ?: song.albumArtUri
                     saveMetadataOverride(prefs, song.id, fix.title, fix.artist, fix.album, artUri)
+                    markAutoFixed(prefs, song.id, add = true)
 
                     songs = songs.map {
                         if (it.id == song.id) it.copy(
@@ -1514,7 +1934,6 @@ fun SoniqApp() {
                             albumArtUri = artUri
                         ) else it
                     }
-
                     if (currentSong?.id == song.id) {
                         currentSong = currentSong?.copy(
                             title = fix.title,
@@ -1523,11 +1942,30 @@ fun SoniqApp() {
                             albumArtUri = artUri
                         )
                     }
+                },
+                onSongUnmatched = { song ->
+                    // An earlier auto-fix that no longer verifies goes back to the file's own tags.
+                    if (song.id.toString() in autoIds) revertIds.add(song.id)
                 }
             )
 
+            if (revertIds.isNotEmpty()) {
+                val rawById = withContext(Dispatchers.IO) {
+                    runCatching { MusicRepository(context).loadSongs() }.getOrDefault(emptyList())
+                }.associateBy { it.id }
+                revertIds.forEach { id ->
+                    removeMetadataOverride(prefs, id)
+                    markAutoFixed(prefs, id, add = false)
+                }
+                songs = songs.map { s -> if (s.id in revertIds) rawById[s.id] ?: s else s }
+            }
+
             isBatchFixing = false
-            batchSummary = "Auto-fix complete! Successfully matched and updated $count songs."
+            val failed = AudioFingerprintFixer.lastRunNetworkFailures
+            val skipped = targets.size - count
+            batchSummary = "Auto-fix complete: updated $count of ${targets.size} songs" +
+                (if (skipped > 0) ", $skipped had no verified match" else "") + "." +
+                (if (failed > 0) " $failed catalog requests failed. Check the internet connection and run it again." else "")
         }
     }
 
@@ -1647,6 +2085,11 @@ fun SoniqApp() {
         }
     }
 
+    LaunchedEffect(currentSong?.id, isPlaying) {
+        NowPlayingState.songId = currentSong?.id
+        NowPlayingState.playing = isPlaying
+    }
+
     LaunchedEffect(timerMinutes) {
         timerLeft = timerMinutes * 60
         while (timerLeft > 0 && timerMinutes > 0) {
@@ -1660,364 +2103,378 @@ fun SoniqApp() {
         }
     }
 
-    Box(Modifier.fillMaxSize()) {
-        LiquidWaterWaveBackground(
-            isPlaying = isPlaying,
-            primaryColor = dynamicPrimaryColor,
-            secondaryColor = dynamicSecondaryColor
-        )
-        
-        // Floating Progress Bar for Auto-Fixer
-        if (isBatchFixing) {
-            Surface(
-                color = Color(0xDD1E1436),
-                shape = RoundedCornerShape(bottomStart = 24.dp, bottomEnd = 24.dp),
-                border = BorderStroke(1.2.dp, ElectricCyan.copy(alpha = 0.6f)),
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .align(Alignment.TopCenter)
-                    .statusBarsPadding()
-                    .zIndex(10f)
-            ) {
-                Column(Modifier.padding(16.dp)) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Icon(Icons.Default.AutoFixHigh, null, tint = ElectricCyan, modifier = Modifier.size(18.dp))
-                            Spacer(Modifier.width(8.dp))
-                            Text("Smart Auto-Fixer Running", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp)
-                        }
-                        Text("$batchCurrent / $batchTotal", color = ElectricCyan, fontSize = 12.sp, fontWeight = FontWeight.Bold)
-                    }
-                    Spacer(Modifier.height(8.dp))
-                    Text(batchTrackName, color = MutedLavender, fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                    Spacer(Modifier.height(6.dp))
-                    LinearProgressIndicator(
-                        progress = { if (batchTotal > 0) batchCurrent.toFloat() / batchTotal else 0f },
-                        modifier = Modifier.fillMaxWidth().height(4.dp).clip(CircleShape),
-                        color = ElectricCyan,
-                        trackColor = Color(0x3353F6FF)
-                    )
-                }
-            }
-        }
-        
-        val bottomPadding = if (currentSong != null) 154.dp else 86.dp
-        Column(
-            Modifier
-                .fillMaxSize()
-                .statusBarsPadding()
-                .padding(bottom = bottomPadding)
-                .padding(horizontal = 16.dp)
-        ) {
-            // Header
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(top = if (isBatchFixing) 72.dp else 10.dp, bottom = 8.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Column(Modifier.weight(1f)) {
-                    Text(
-                        "SONIQ",
-                        color = Color.White,
-                        fontSize = 28.sp,
-                        fontWeight = FontWeight.Black,
-                        letterSpacing = 1.4.sp
-                    )
-                    Text("Liquid Gyro Acoustics • Studio Suite", color = MutedLavender, fontSize = 11.sp)
-                }
-                Surface(
-                    color = GlassPill,
-                    shape = RoundedCornerShape(20.dp),
-                    border = BorderStroke(1.dp, GlassBorder),
-                    modifier = Modifier.clickable { launchPartyMode() }
-                ) {
-                    Row(
-                        Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Icon(Icons.Default.Headphones, contentDescription = "Party Share", tint = dynamicSecondaryColor, modifier = Modifier.size(16.dp))
-                        Spacer(Modifier.width(4.dp))
-                        Text("Party", color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold)
-                    }
-                }
-            }
-
-            // Liquid Glass Search Bar
-            AnimatedVisibility(visible = currentTab == MainTab.HOME || currentTab == MainTab.LIBRARY) {
-                Column {
-                    OutlinedTextField(
-                        value = query,
-                        onValueChange = {
-                            query = it
-                            if (it.isNotBlank() && currentTab == MainTab.HOME) {
-                                currentTab = MainTab.LIBRARY
-                            }
-                            if (it.trim().length >= 3) {
-                                val clean = it.trim()
-                                searchHistory = (listOf(clean) + searchHistory.filterNot { old -> old.equals(clean, true) }).take(6)
-                                prefs.edit().putString("search_history_ordered", searchHistory.joinToString("|")).apply()
-                            }
-                        },
-                        modifier = Modifier.fillMaxWidth(),
-                        placeholder = {
-                            Text(
-                                "Search songs, artists, albums, folders...",
-                                color = MutedLavender.copy(alpha = 0.6f),
-                                fontSize = 13.sp
-                            )
-                        },
-                        leadingIcon = { Icon(Icons.Default.Search, null, tint = dynamicSecondaryColor) },
-                        trailingIcon = {
-                            if (query.isNotEmpty()) {
-                                IconButton(onClick = { query = "" }) {
-                                    Icon(Icons.Default.Close, "Clear", tint = MutedLavender)
-                                }
-                            }
-                        },
-                        singleLine = true,
-                        shape = RoundedCornerShape(26.dp),
-                        textStyle = TextStyle(color = Color.White, fontSize = 15.sp),
-                        colors = OutlinedTextFieldDefaults.colors(
-                            focusedContainerColor = LiquidGlassBackground,
-                            unfocusedContainerColor = LiquidGlassBackground.copy(alpha = 0.05f),
-                            focusedBorderColor = LiquidGlassGlow,
-                            unfocusedBorderColor = LiquidGlassBorder,
-                            focusedTextColor = Color.White,
-                            unfocusedTextColor = Color.White,
-                            cursorColor = dynamicSecondaryColor
-                        )
-                    )
-
-                    if (query.isEmpty() && searchHistory.isNotEmpty() && currentTab == MainTab.LIBRARY) {
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .horizontalScroll(rememberScrollState())
-                                .padding(top = 6.dp),
-                            horizontalArrangement = Arrangement.spacedBy(6.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Icon(Icons.Default.History, null, tint = MutedLavender.copy(alpha = 0.6f), modifier = Modifier.size(14.dp))
-                            searchHistory.forEach { term ->
-                                SuggestionChip(
-                                    onClick = { query = term },
-                                    label = { Text(term, fontSize = 11.sp, color = MutedLavender) },
-                                    shape = RoundedCornerShape(14.dp),
-                                    border = BorderStroke(0.8.dp, GlassBorder)
-                                )
-                            }
-                        }
-                    }
-                    Spacer(Modifier.height(8.dp))
-                }
-            }
-
-            AnimatedContent(
-                targetState = currentTab,
-                transitionSpec = { fadeIn(tween(220)) togetherWith fadeOut(tween(180)) },
-                label = "screen_transition"
-            ) { target ->
-                when (target) {
-                    MainTab.HOME -> HomeScreen(
-                        songs = songs,
-                        recents = recents,
-                        favorites = favorites,
-                        onPlay = { song, list -> playSong(song, list) },
-                        onFavorite = { song ->
-                            favorites = if (song.id.toString() in favorites) favorites - song.id.toString()
-                            else favorites + song.id.toString()
-                            saveFavorites()
-                        },
-                        onAddToPlaylist = { addToPlaylistSong = it },
-                        onAddToAlbum = { addToAlbumSong = it },
-                        onEdit = { editTagSong = it },
-                        onNavigateLibrary = { mode ->
-                            libraryMode = mode
-                            selectedFilterKey = null
-                            currentTab = MainTab.LIBRARY
-                        }
-                    )
-                    MainTab.LIBRARY -> LibraryScreen(
-                        allSongs = songs,
-                        mode = libraryMode,
-                        onMode = {
-                            libraryMode = it
-                            selectedFilterKey = null
-                        },
-                        filterKey = selectedFilterKey,
-                        onFilterKey = { selectedFilterKey = it },
-                        query = query,
-                        listState = listState,
-                        favorites = favorites,
-                        recents = recents,
-                        playlistName = selectedPlaylist,
-                        playlistSongs = playlistSongs,
-                        customAlbums = customAlbums,
-                        getCustomAlbumSongs = { albumName ->
-                            val raw = prefs.getString("album_$albumName", "") ?: ""
-                            raw.split("|").filter { it.isNotBlank() }.toSet()
-                        },
-                        onCreateAlbum = { showCreateAlbum = true },
-                        onAutoFixAll = { triggerBatchFix() },
-                        onPlay = { song, list -> playSong(song, list) },
-                        onFavorite = { song ->
-                            favorites = if (song.id.toString() in favorites) favorites - song.id.toString()
-                            else favorites + song.id.toString()
-                            saveFavorites()
-                        },
-                        onAddToPlaylist = { addToPlaylistSong = it },
-                        onAddToAlbum = { addToAlbumSong = it },
-                        onEdit = { editTagSong = it },
-                        modifier = Modifier.fillMaxSize()
-                    )
-                    MainTab.EQUALIZER -> EqualizerScreen(Modifier.fillMaxSize())
-                    MainTab.PLAYLISTS -> PlaylistScreen(
-                        playlists = playlists,
-                        selected = selectedPlaylist,
-                        allSongs = songs,
-                        getPlaylistTrackIds = { name ->
-                            if (name == "Favorites") favorites
-                            else prefs.getString("playlist_$name", "")?.split("|")?.filter { it.isNotBlank() }?.toSet() ?: emptySet()
-                        },
-                        onOpen = { name ->
-                            selectedPlaylist = name
-                            playlistSongs = if (name == "Favorites") favorites
-                            else prefs.getString("playlist_$name", "")?.split("|")?.filter { it.isNotBlank() }?.toSet() ?: emptySet()
-                            libraryMode = "Playlist"
-                            selectedFilterKey = null
-                            currentTab = MainTab.LIBRARY
-                        },
-                        onPlayAll = { name ->
-                            val ids = if (name == "Favorites") favorites
-                            else prefs.getString("playlist_$name", "")?.split("|")?.filter { it.isNotBlank() }?.toSet() ?: emptySet()
-                            val list = songs.filter { it.id.toString() in ids }
-                            if (list.isNotEmpty()) playSong(list.first(), list)
-                        },
-                        onDelete = { name ->
-                            if (name != "Favorites") {
-                                playlists = playlists - name
-                                prefs.edit().putStringSet("playlists", playlists.toSet()).remove("playlist_$name").apply()
-                            }
-                        },
-                        onCreate = { showCreatePlaylist = true },
-                        modifier = Modifier.fillMaxSize()
-                    )
-                    MainTab.SETTINGS -> SettingsScreen(
-                        songCount = songs.size,
-                        outputs = outputs,
-                        timerMinutes = timerMinutes,
-                        timerLeft = timerLeft,
-                        customTimer = customTimer,
-                        isScanningDuplicates = isScanningDuplicates,
-                        onCustomTimerChange = { customTimer = it },
-                        onSetTimer = { timerMinutes = it },
-                        onCancelTimer = { timerMinutes = 0 },
-                        onRescan = {
-                            val loaded = MusicRepository(context).loadSongs()
-                            songs = applySavedMetadataOverrides(loaded, prefs)
-                            Toast.makeText(context, "Rescanned ${songs.size} tracks", Toast.LENGTH_SHORT).show()
-                        },
-                        onAutoFixAll = { triggerBatchFix() },
-                        onScanDuplicates = {
-                            if (!isScanningDuplicates) {
-                                scope.launch {
-                                    isScanningDuplicates = true
-                                    duplicateGroups = DuplicateCleanerEngine.findDuplicates(context, songs)
-                                    isScanningDuplicates = false
-                                }
-                            }
-                        },
-                        onLaunchDualAudio = { launchPartyMode() },
-                        modifier = Modifier.fillMaxSize()
-                    )
-                }
-            }
-        }
-
-        Column(
-            Modifier
-                .align(Alignment.BottomCenter)
-                .navigationBarsPadding()
-                .padding(horizontal = 16.dp, vertical = 10.dp),
-            verticalArrangement = Arrangement.spacedBy(8.dp)
-        ) {
-            if (currentSong != null && !showPlayer) {
-                FloatingMiniPlayer(
-                    song = currentSong!!,
-                    isPlaying = isPlaying,
-                    progress = if (duration > 0) (position.toFloat() / duration).coerceIn(0f, 1f) else 0f,
-                    primaryColor = dynamicPrimaryColor,
-                    secondaryColor = dynamicSecondaryColor,
-                    onOpen = { showPlayer = true },
-                    onPlayPause = { controller?.let { if (it.isPlaying) it.pause() else it.play() } },
-                    onNext = { controller?.seekToNextMediaItem() }
-                )
-            }
-            FloatingBottomNavBar(
-                currentTab = currentTab,
-                activeColor = dynamicSecondaryColor,
-                onSelect = { currentTab = it }
+    FluidTouchCanvas(rippleColor = dynamicSecondaryColor) {
+        Box(Modifier.fillMaxSize()) {
+            LiquidWaterWaveBackground(
+                isPlaying = isPlaying,
+                primaryColor = dynamicPrimaryColor,
+                secondaryColor = dynamicSecondaryColor,
+                pitch = gyroEngine.pitch,
+                roll = gyroEngine.roll
             )
-        }
-
-        // Main Now Playing Screen
-        if (showPlayer && currentSong != null) {
-            val animatedOffsetY by animateFloatAsState(
-                targetValue = playerOffsetY,
-                animationSpec = spring(dampingRatio = Spring.DampingRatioLowBouncy, stiffness = Spring.StiffnessMedium),
-                label = "player_drag"
-            )
-            Box(
+            val bottomPadding = if (currentSong != null) 176.dp else 96.dp
+            Column(
                 Modifier
                     .fillMaxSize()
-                    .offset { IntOffset(0, animatedOffsetY.roundToInt()) }
-                    .draggable(
-                        orientation = Orientation.Vertical,
-                        state = rememberDraggableState { delta ->
-                            playerOffsetY = (playerOffsetY + delta).coerceAtLeast(0f)
-                        },
-                        onDragStopped = {
-                            if (playerOffsetY > 340f) {
-                                showPlayer = false
+                    .statusBarsPadding()
+                    .padding(bottom = bottomPadding)
+                    .padding(horizontal = 16.dp)
+            ) {
+                // Header
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(top = 10.dp, bottom = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(Modifier.weight(1f)) {
+                        Text(
+                            "SONIQ",
+                            color = NeoInk,
+                            fontSize = 28.sp,
+                            fontWeight = FontWeight.Black,
+                            letterSpacing = 1.4.sp
+                        )
+                        Text("Liquid Gyro Acoustics • Studio Suite", color = MutedLavender, fontSize = 11.sp)
+                    }
+                    Surface(
+                        color = NeoSurface, shadowElevation = 6.dp,
+                        shape = RoundedCornerShape(20.dp),
+                        border = BorderStroke(1.dp, GlassBorder),
+                        modifier = Modifier.clickable { launchPartyMode() }
+                    ) {
+                        Row(
+                            Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(Icons.Default.Headphones, contentDescription = "Party Share", tint = dynamicSecondaryColor, modifier = Modifier.size(16.dp))
+                            Spacer(Modifier.width(4.dp))
+                            Text("Party", color = NeoInk, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                        }
+                    }
+                }
+
+                // Search Bar
+                AnimatedVisibility(visible = currentTab == MainTab.HOME || currentTab == MainTab.LIBRARY) {
+                    Column {
+                        // Liquid-glass search pill: frosted white, blue gradient edge and blue glow
+                        val searchShape = RoundedCornerShape(26.dp)
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .shadow(14.dp, searchShape, ambientColor = GlassGlow, spotColor = GlassGlow)
+                                .clip(searchShape)
+                                .background(Brush.horizontalGradient(listOf(GlassFrost, Color(0xB3E3F3FF))))
+                                .border(1.2.dp, Brush.linearGradient(listOf(GlassBlueA, GlassBlueB)), searchShape)
+                        ) {
+                            OutlinedTextField(
+                                value = query,
+                                onValueChange = {
+                                    query = it
+                                    if (it.isNotBlank() && currentTab == MainTab.HOME) {
+                                        currentTab = MainTab.LIBRARY
+                                    }
+                                    if (it.trim().length >= 3) {
+                                        val clean = it.trim()
+                                        searchHistory = (listOf(clean) + searchHistory.filterNot { old -> old.equals(clean, true) }).take(6)
+                                        prefs.edit().putString("search_history_ordered", searchHistory.joinToString("|")).apply()
+                                    }
+                                },
+                                modifier = Modifier.fillMaxWidth(),
+                                placeholder = {
+                                    Text(
+                                        "Search songs, artists, albums, folders...",
+                                        color = MutedLavender.copy(alpha = 0.6f),
+                                        fontSize = 13.sp
+                                    )
+                                },
+                                leadingIcon = { Icon(Icons.Default.Search, null, tint = dynamicSecondaryColor) },
+                                trailingIcon = {
+                                    if (query.isNotEmpty()) {
+                                        IconButton(onClick = { query = "" }) {
+                                            Icon(Icons.Default.Close, "Clear", tint = MutedLavender)
+                                        }
+                                    }
+                                },
+                                singleLine = true,
+                                shape = RoundedCornerShape(26.dp),
+                                colors = OutlinedTextFieldDefaults.colors(
+                                    focusedBorderColor = Color.Transparent,
+                                    unfocusedBorderColor = Color.Transparent,
+                                    focusedTextColor = NeoInk,
+                                    unfocusedTextColor = NeoInk,
+                                    cursorColor = dynamicSecondaryColor,
+                                    focusedContainerColor = Color.Transparent,
+                                    unfocusedContainerColor = Color.Transparent
+                                )
+                            )
+                        }
+
+                        if (query.isEmpty() && searchHistory.isNotEmpty() && currentTab == MainTab.LIBRARY) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .horizontalScroll(rememberScrollState())
+                                    .padding(top = 6.dp),
+                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Icon(Icons.Default.History, null, tint = MutedLavender.copy(alpha = 0.6f), modifier = Modifier.size(14.dp))
+                                searchHistory.forEach { term ->
+                                    SuggestionChip(
+                                        onClick = { query = term },
+                                        label = { Text(term, fontSize = 11.sp, color = MutedLavender) },
+                                        shape = RoundedCornerShape(14.dp),
+                                        border = BorderStroke(0.8.dp, GlassBorder)
+                                    )
+                                }
                             }
-                            playerOffsetY = 0f
+                        }
+                        Spacer(Modifier.height(8.dp))
+                    }
+                }
+
+                AnimatedContent(
+                    targetState = currentTab,
+                    transitionSpec = { fadeIn(tween(220)) togetherWith fadeOut(tween(180)) },
+                    label = "screen_transition"
+                ) { target ->
+                    when (target) {
+                        MainTab.HOME -> HomeScreen(
+                            songs = songs,
+                            recents = recents,
+                            favorites = favorites,
+                            onPlay = { song, list -> playSong(song, list) },
+                            onFavorite = { song ->
+                                favorites = if (song.id.toString() in favorites) favorites - song.id.toString()
+                                else favorites + song.id.toString()
+                                saveFavorites()
+                            },
+                            onAddToPlaylist = { addToPlaylistSong = it },
+                            onAddToAlbum = { addToAlbumSong = it },
+                            onEdit = { editTagSong = it },
+                            onNavigateLibrary = { mode ->
+                                libraryMode = mode
+                                selectedFilterKey = null
+                                currentTab = MainTab.LIBRARY
+                            }
+                        )
+                        MainTab.LIBRARY -> LibraryScreen(
+                            allSongs = songs,
+                            mode = libraryMode,
+                            onMode = {
+                                libraryMode = it
+                                selectedFilterKey = null
+                            },
+                            filterKey = selectedFilterKey,
+                            onFilterKey = { selectedFilterKey = it },
+                            query = query,
+                            listState = listState,
+                            favorites = favorites,
+                            recents = recents,
+                            playlistName = selectedPlaylist,
+                            playlistSongs = playlistSongs,
+                            customAlbums = customAlbums,
+                            getCustomAlbumSongs = { albumName ->
+                                val raw = prefs.getString("album_$albumName", "") ?: ""
+                                raw.split("|").filter { it.isNotBlank() }.toSet()
+                            },
+                            onCreateAlbum = { showCreateAlbum = true },
+                            onAutoFixAll = { triggerBatchFix() },
+                            onPlay = { song, list -> playSong(song, list) },
+                            onFavorite = { song ->
+                                favorites = if (song.id.toString() in favorites) favorites - song.id.toString()
+                                else favorites + song.id.toString()
+                                saveFavorites()
+                            },
+                            onAddToPlaylist = { addToPlaylistSong = it },
+                            onAddToAlbum = { addToAlbumSong = it },
+                            onEdit = { editTagSong = it },
+                            modifier = Modifier.fillMaxSize()
+                        )
+                        MainTab.EQUALIZER -> EqualizerScreen(Modifier.fillMaxSize())
+                        MainTab.PLAYLISTS -> PlaylistScreen(
+                            playlists = playlists,
+                            selected = selectedPlaylist,
+                            allSongs = songs,
+                            getPlaylistTrackIds = { name ->
+                                if (name == "Favorites") favorites
+                                else prefs.getString("playlist_$name", "")?.split("|")?.filter { it.isNotBlank() }?.toSet() ?: emptySet()
+                            },
+                            onOpen = { name ->
+                                selectedPlaylist = name
+                                playlistSongs = if (name == "Favorites") favorites
+                                else prefs.getString("playlist_$name", "")?.split("|")?.filter { it.isNotBlank() }?.toSet() ?: emptySet()
+                                libraryMode = "Playlist"
+                                selectedFilterKey = null
+                                currentTab = MainTab.LIBRARY
+                            },
+                            onPlayAll = { name ->
+                                val ids = if (name == "Favorites") favorites
+                                else prefs.getString("playlist_$name", "")?.split("|")?.filter { it.isNotBlank() }?.toSet() ?: emptySet()
+                                val list = songs.filter { it.id.toString() in ids }
+                                if (list.isNotEmpty()) playSong(list.first(), list)
+                            },
+                            onDelete = { name ->
+                                if (name != "Favorites") {
+                                    playlists = playlists - name
+                                    prefs.edit().putStringSet("playlists", playlists.toSet()).remove("playlist_$name").apply()
+                                }
+                            },
+                            onCreate = { showCreatePlaylist = true },
+                            modifier = Modifier.fillMaxSize()
+                        )
+                        MainTab.SETTINGS -> SettingsScreen(
+                            songCount = songs.size,
+                            outputs = outputs,
+                            timerMinutes = timerMinutes,
+                            timerLeft = timerLeft,
+                            customTimer = customTimer,
+                            isScanningDuplicates = isScanningDuplicates,
+                            onCustomTimerChange = { customTimer = it },
+                            onSetTimer = { timerMinutes = it },
+                            onCancelTimer = { timerMinutes = 0 },
+                            onRescan = {
+                                val loaded = MusicRepository(context).loadSongs()
+                                songs = applySavedMetadataOverrides(loaded, prefs)
+                                Toast.makeText(context, "Rescanned ${songs.size} tracks", Toast.LENGTH_SHORT).show()
+                            },
+                            onAutoFixAll = { triggerBatchFix() },
+                            onScanDuplicates = {
+                                if (!isScanningDuplicates) {
+                                    scope.launch {
+                                        isScanningDuplicates = true
+                                        duplicateGroups = DuplicateCleanerEngine.findDuplicates(context, songs)
+                                        isScanningDuplicates = false
+                                    }
+                                }
+                            },
+                            onLaunchDualAudio = { launchPartyMode() },
+                            modifier = Modifier.fillMaxSize()
+                        )
+                    }
+                }
+            }
+
+            Column(
+                Modifier
+                    .align(Alignment.BottomCenter)
+                    .navigationBarsPadding()
+                    .padding(horizontal = 16.dp, vertical = 10.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                if (currentSong != null && !showPlayer && !showDeepOceanLockScreen) {
+                    FloatingMiniPlayer(
+                        song = currentSong!!,
+                        isPlaying = isPlaying,
+                        progress = if (duration > 0) (position.toFloat() / duration).coerceIn(0f, 1f) else 0f,
+                        primaryColor = dynamicPrimaryColor,
+                        secondaryColor = dynamicSecondaryColor,
+                        onOpen = { showPlayer = true },
+                        onPlayPause = { controller?.let { if (it.isPlaying) it.pause() else it.play() } },
+                        onNext = { skipTrack(true) }
+                    )
+                }
+                FloatingBottomNavBar(
+                    currentTab = currentTab,
+                    activeColor = dynamicSecondaryColor,
+                    onSelect = { currentTab = it }
+                )
+            }
+
+            // Main Now Playing Screen
+            if (showPlayer && currentSong != null && !showDeepOceanLockScreen) {
+                val animatedOffsetY by animateFloatAsState(
+                    targetValue = playerOffsetY,
+                    animationSpec = spring(dampingRatio = Spring.DampingRatioLowBouncy, stiffness = Spring.StiffnessMedium),
+                    label = "player_drag"
+                )
+                Box(
+                    Modifier
+                        .fillMaxSize()
+                        .offset { IntOffset(0, animatedOffsetY.roundToInt()) }
+                        .draggable(
+                            orientation = Orientation.Vertical,
+                            state = rememberDraggableState { delta ->
+                                playerOffsetY = (playerOffsetY + delta).coerceAtLeast(0f)
+                            },
+                            onDragStopped = {
+                                if (playerOffsetY > 340f) {
+                                    showPlayer = false
+                                }
+                                playerOffsetY = 0f
+                            }
+                        )
+                ) {
+                    FullPlayer(
+                        song = currentSong!!,
+                        isPlaying = isPlaying,
+                        position = position,
+                        duration = duration,
+                        shuffle = shuffle,
+                        repeatMode = repeatMode,
+                        speedMode = currentSpeedMode,
+                        slowedSpeedFactor = slowedSpeedFactor,
+                        reverbStrengthFactor = reverbStrengthFactor,
+                        onSlowedSpeedChange = { speed ->
+                            slowedSpeedFactor = speed
+                            applyPlaybackSettings("Slowed", speed, reverbStrengthFactor)
+                        },
+                        onReverbStrengthChange = { rev ->
+                            reverbStrengthFactor = rev
+                            applyPlaybackSettings("Slowed", slowedSpeedFactor, rev)
+                        },
+                        onSpeedModeChange = { mode ->
+                            applyPlaybackSettings(mode, slowedSpeedFactor, reverbStrengthFactor)
+                        },
+                        isFavorite = currentSong!!.id.toString() in favorites,
+                        primaryAccent = dynamicPrimaryColor,
+                        secondaryAccent = dynamicSecondaryColor,
+                        gyroPitch = gyroEngine.pitch,
+                        gyroRoll = gyroEngine.roll,
+                        onClose = { showPlayer = false },
+                        onOpenLockScreen = { showDeepOceanLockScreen = true },
+                        onPlayPause = { controller?.let { if (it.isPlaying) it.pause() else it.play() } },
+                        onNext = { skipTrack(true) },
+                        onPrevious = { skipTrack(false) },
+                        onSeek = { controller?.seekTo(it) },
+                        onShuffle = { shuffle = !shuffle; controller?.shuffleModeEnabled = shuffle },
+                        onRepeat = {
+                            repeatMode = when (repeatMode) {
+                                Player.REPEAT_MODE_OFF -> Player.REPEAT_MODE_ALL
+                                Player.REPEAT_MODE_ALL -> Player.REPEAT_MODE_ONE
+                                else -> Player.REPEAT_MODE_OFF
+                            }
+                            controller?.repeatMode = repeatMode
+                        },
+                        onToggleFavorite = {
+                            val id = currentSong!!.id.toString()
+                            favorites = if (id in favorites) favorites - id else favorites + id
+                            saveFavorites()
+                        },
+                        onLaunchParty = { launchPartyMode() },
+                        onOpenEqualizer = {
+                            showPlayer = false
+                            currentTab = MainTab.EQUALIZER
                         }
                     )
-            ) {
-                FullPlayer(
+                }
+            }
+
+            // Deep Ocean Lock-Screen View (#18)
+            if (showDeepOceanLockScreen && currentSong != null) {
+                DeepOceanLockScreenView(
                     song = currentSong!!,
                     isPlaying = isPlaying,
                     position = position,
                     duration = duration,
                     shuffle = shuffle,
                     repeatMode = repeatMode,
-                    speedMode = currentSpeedMode,
-                    slowedSpeedFactor = slowedSpeedFactor,
-                    reverbStrengthFactor = reverbStrengthFactor,
-                    onSlowedSpeedChange = { speed ->
-                        slowedSpeedFactor = speed
-                        applyPlaybackSettings("Slowed", speed, reverbStrengthFactor)
-                    },
-                    onReverbStrengthChange = { rev ->
-                        reverbStrengthFactor = rev
-                        applyPlaybackSettings("Slowed", slowedSpeedFactor, rev)
-                    },
-                    onSpeedModeChange = { mode ->
-                        applyPlaybackSettings(mode, slowedSpeedFactor, reverbStrengthFactor)
-                    },
-                    isFavorite = currentSong!!.id.toString() in favorites,
-                    primaryAccent = dynamicPrimaryColor,
-                    secondaryAccent = dynamicSecondaryColor,
-                    onClose = { showPlayer = false },
-                    onOpenLockScreen = { },
+                    gyroPitch = gyroEngine.pitch,
+                    gyroRoll = gyroEngine.roll,
                     onPlayPause = { controller?.let { if (it.isPlaying) it.pause() else it.play() } },
-                    onNext = { controller?.seekToNextMediaItem() },
-                    onPrevious = { controller?.seekToPreviousMediaItem() },
+                    onNext = { skipTrack(true) },
+                    onPrevious = { skipTrack(false) },
                     onSeek = { controller?.seekTo(it) },
                     onShuffle = { shuffle = !shuffle; controller?.shuffleModeEnabled = shuffle },
                     onRepeat = {
@@ -2028,259 +2485,240 @@ fun SoniqApp() {
                         }
                         controller?.repeatMode = repeatMode
                     },
-                    onToggleFavorite = {
-                        val id = currentSong!!.id.toString()
-                        favorites = if (id in favorites) favorites - id else favorites + id
-                        saveFavorites()
+                    onCloseLockScreen = { showDeepOceanLockScreen = false }
+                )
+            }
+
+            duplicateGroups?.let { groups ->
+                AlertDialog(
+                    onDismissRequest = { duplicateGroups = null },
+                    containerColor = NeoDialog,
+                    title = {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(Icons.Default.CleaningServices, null, tint = ElectricCyan)
+                            Spacer(Modifier.width(8.dp))
+                            Text("Duplicate & Bitrate Cleaner", color = NeoInk, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                        }
                     },
-                    onLaunchParty = { launchPartyMode() },
-                    onOpenEqualizer = {
-                        showPlayer = false
-                        currentTab = MainTab.EQUALIZER
+                    text = {
+                        if (groups.isEmpty()) {
+                            Text("No duplicate or low-bitrate copies detected in your library!", color = MutedLavender)
+                        } else {
+                            LazyColumn(modifier = Modifier.heightIn(max = 350.dp)) {
+                                items(groups) { group ->
+                                    Column(Modifier.padding(vertical = 6.dp)) {
+                                        Text(group.cleanTitle, color = ElectricCyan, fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                                        group.songs.forEach { item ->
+                                            Row(
+                                                modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp),
+                                                horizontalArrangement = Arrangement.SpaceBetween,
+                                                verticalAlignment = Alignment.CenterVertically
+                                            ) {
+                                                Text(
+                                                    "${item.song.folder} • ${item.bitrateKbps} kbps",
+                                                    color = if (item.bitrateKbps >= 256) NeoOk else MutedLavender,
+                                                    fontSize = 11.sp
+                                                )
+                                                if (item.bitrateKbps < 256) {
+                                                    Text(
+                                                        "Lower Bitrate",
+                                                        color = NeoDanger,
+                                                        fontSize = 10.sp,
+                                                        fontWeight = FontWeight.Bold
+                                                    )
+                                                }
+                                            }
+                                        }
+                                        HorizontalDivider(color = Color(0x331B6FE0), modifier = Modifier.padding(top = 4.dp))
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    confirmButton = {
+                        TextButton(onClick = { duplicateGroups = null }) { Text("Close", color = ElectricCyan) }
                     }
                 )
             }
-        }
 
-        duplicateGroups?.let { groups ->
-            AlertDialog(
-                onDismissRequest = { duplicateGroups = null },
-                containerColor = Color(0xFF1E1436),
-                title = {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Icon(Icons.Default.CleaningServices, null, tint = ElectricCyan)
-                        Spacer(Modifier.width(8.dp))
-                        Text("Duplicate & Bitrate Cleaner", color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold)
-                    }
-                },
-                text = {
-                    if (groups.isEmpty()) {
-                        Text("No duplicate or low-bitrate copies detected in your library!", color = MutedLavender)
-                    } else {
-                        LazyColumn(modifier = Modifier.heightIn(max = 350.dp)) {
-                            items(groups) { group ->
-                                Column(Modifier.padding(vertical = 6.dp)) {
-                                    Text(group.cleanTitle, color = ElectricCyan, fontWeight = FontWeight.Bold, fontSize = 13.sp)
-                                    group.songs.forEach { item ->
-                                        Row(
-                                            modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp),
-                                            horizontalArrangement = Arrangement.SpaceBetween,
-                                            verticalAlignment = Alignment.CenterVertically
-                                        ) {
-                                            Text(
-                                                "${item.song.folder} • ${item.bitrateKbps} kbps",
-                                                color = if (item.bitrateKbps >= 256) Color(0xFF50FA7B) else MutedLavender,
-                                                fontSize = 11.sp
-                                            )
-                                            if (item.bitrateKbps < 256) {
-                                                Text(
-                                                    "Lower Bitrate",
-                                                    color = Color(0xFFFF5286),
-                                                    fontSize = 10.sp,
-                                                    fontWeight = FontWeight.Bold
-                                                )
-                                            }
-                                        }
-                                    }
-                                    HorizontalDivider(color = Color(0x3353F6FF), modifier = Modifier.padding(top = 4.dp))
-                                }
-                            }
-                        }
-                    }
-                },
-                confirmButton = {
-                    TextButton(onClick = { duplicateGroups = null }) { Text("Close", color = ElectricCyan) }
-                }
+            AutoFixBatchDialog(
+                isRunning = isBatchFixing,
+                current = batchCurrent,
+                total = batchTotal,
+                currentTrackTitle = batchTrackName,
+                summaryMessage = batchSummary,
+                onDismissSummary = { batchSummary = null }
             )
-        }
 
-        if (batchSummary != null) {
-            AlertDialog(
-                onDismissRequest = { batchSummary = null },
-                containerColor = Color(0xFF1E1436),
-                title = {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Icon(Icons.Default.AutoFixHigh, null, tint = ElectricCyan)
-                        Spacer(Modifier.width(8.dp))
-                        Text("Auto-Fix Complete", color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold)
-                    }
-                },
-                text = { Text(batchSummary!!, color = MutedLavender, fontSize = 14.sp) },
-                confirmButton = {
-                    TextButton(onClick = { batchSummary = null }) { Text("Close", color = ElectricCyan) }
-                }
-            )
-        }
-
-        if (showCreatePlaylist) {
-            AlertDialog(
-                onDismissRequest = { showCreatePlaylist = false },
-                containerColor = Color(0xFF1E1436),
-                title = { Text("Create New Playlist", color = Color.White) },
-                text = {
-                    OutlinedTextField(
-                        value = newPlaylistName,
-                        onValueChange = { newPlaylistName = it },
-                        label = { Text("Playlist Name", color = MutedLavender) },
-                        singleLine = true,
-                        textStyle = TextStyle(color = Color.White, fontSize = 15.sp),
-                        colors = OutlinedTextFieldDefaults.colors(
-                            focusedTextColor = Color.White,
-                            unfocusedTextColor = Color.White,
-                            focusedBorderColor = ElectricCyan
+            if (showCreatePlaylist) {
+                AlertDialog(
+                    onDismissRequest = { showCreatePlaylist = false },
+                    containerColor = NeoDialog,
+                    title = { Text("Create New Playlist", color = NeoInk) },
+                    text = {
+                        OutlinedTextField(
+                            value = newPlaylistName,
+                            onValueChange = { newPlaylistName = it },
+                            label = { Text("Playlist Name", color = MutedLavender) },
+                            singleLine = true,
+                            colors = OutlinedTextFieldDefaults.colors(
+                                focusedTextColor = NeoInk,
+                                unfocusedTextColor = NeoInk,
+                                focusedBorderColor = ElectricCyan
+                            )
                         )
-                    )
-                },
-                confirmButton = {
-                    TextButton(onClick = {
-                        val name = newPlaylistName.trim()
-                        if (name.isNotEmpty()) {
-                            playlists = (playlists + name).distinct().sorted()
-                            prefs.edit().putStringSet("playlists", playlists.toSet()).apply()
-                            prefs.edit().putString("playlist_$name", "").apply()
-                        }
-                        newPlaylistName = ""
-                        showCreatePlaylist = false
-                    }) { Text("Create", color = ElectricCyan) }
-                },
-                dismissButton = {
-                    TextButton(onClick = { showCreatePlaylist = false }) { Text("Cancel", color = MutedLavender) }
-                }
-            )
-        }
-
-        addToPlaylistSong?.let { song ->
-            AlertDialog(
-                onDismissRequest = { addToPlaylistSong = null },
-                containerColor = Color(0xFF1E1436),
-                title = { Text("Add to Playlist", color = Color.White) },
-                text = {
-                    Column {
-                        playlists.forEach { name ->
-                            TextButton(
-                                onClick = {
-                                    if (name == "Favorites") {
-                                        favorites = favorites + song.id.toString()
-                                        saveFavorites()
-                                    } else {
-                                        val raw = prefs.getString("playlist_$name", "") ?: ""
-                                        val ids = raw.split("|").filter { it.isNotBlank() }.toSet() + song.id.toString()
-                                        prefs.edit().putString("playlist_$name", ids.joinToString("|")).apply()
-                                        if (name == selectedPlaylist) playlistSongs = ids
-                                    }
-                                    addToPlaylistSong = null
-                                },
-                                modifier = Modifier.fillMaxWidth()
-                            ) {
-                                Text(name, color = ElectricCyan)
+                    },
+                    confirmButton = {
+                        TextButton(onClick = {
+                            val name = newPlaylistName.trim()
+                            if (name.isNotEmpty()) {
+                                playlists = (playlists + name).distinct().sorted()
+                                prefs.edit().putStringSet("playlists", playlists.toSet()).apply()
+                                prefs.edit().putString("playlist_$name", "").apply()
                             }
-                        }
+                            newPlaylistName = ""
+                            showCreatePlaylist = false
+                        }) { Text("Create", color = ElectricCyan) }
+                    },
+                    dismissButton = {
+                        TextButton(onClick = { showCreatePlaylist = false }) { Text("Cancel", color = MutedLavender) }
                     }
-                },
-                confirmButton = {},
-                dismissButton = {
-                    TextButton(onClick = { addToPlaylistSong = null }) { Text("Cancel", color = MutedLavender) }
-                }
-            )
-        }
+                )
+            }
 
-        if (showCreateAlbum) {
-            AlertDialog(
-                onDismissRequest = { showCreateAlbum = false },
-                containerColor = Color(0xFF1E1436),
-                title = { Text("Create Custom Album", color = Color.White) },
-                text = {
-                    OutlinedTextField(
-                        value = newAlbumName,
-                        onValueChange = { newAlbumName = it },
-                        label = { Text("Album Name", color = MutedLavender) },
-                        singleLine = true,
-                        textStyle = TextStyle(color = Color.White, fontSize = 15.sp),
-                        colors = OutlinedTextFieldDefaults.colors(
-                            focusedTextColor = Color.White,
-                            unfocusedTextColor = Color.White,
-                            focusedBorderColor = ElectricCyan
-                        )
-                    )
-                },
-                confirmButton = {
-                    TextButton(onClick = {
-                        val name = newAlbumName.trim()
-                        if (name.isNotEmpty()) {
-                            customAlbums = (customAlbums + name).distinct().sorted()
-                            prefs.edit().putStringSet("custom_albums", customAlbums.toSet()).apply()
-                            prefs.edit().putString("album_$name", "").apply()
-                        }
-                        newAlbumName = ""
-                        showCreateAlbum = false
-                    }) { Text("Create", color = ElectricCyan) }
-                },
-                dismissButton = {
-                    TextButton(onClick = { showCreateAlbum = false }) { Text("Cancel", color = MutedLavender) }
-                }
-            )
-        }
-
-        addToAlbumSong?.let { song ->
-            AlertDialog(
-                onDismissRequest = { addToAlbumSong = null },
-                containerColor = Color(0xFF1E1436),
-                title = { Text("Add Track to Album", color = Color.White) },
-                text = {
-                    if (customAlbums.isEmpty()) {
-                        Text("No custom albums created yet. Tap '+ Album' in the Albums tab to create one.", color = MutedLavender)
-                    } else {
+            addToPlaylistSong?.let { song ->
+                AlertDialog(
+                    onDismissRequest = { addToPlaylistSong = null },
+                    containerColor = NeoDialog,
+                    title = { Text("Add to Playlist", color = NeoInk) },
+                    text = {
                         Column {
-                            for (albName in customAlbums) {
+                            playlists.forEach { name ->
                                 TextButton(
                                     onClick = {
-                                        val raw = prefs.getString("album_$albName", "") ?: ""
-                                        val existing: Set<String> = raw.split("|").filter { it.isNotBlank() }.toSet()
-                                        val updated: Set<String> = existing + song.id.toString()
-                                        prefs.edit().putString("album_$albName", updated.joinToString("|")).apply()
-                                        addToAlbumSong = null
+                                        if (name == "Favorites") {
+                                            favorites = favorites + song.id.toString()
+                                            saveFavorites()
+                                        } else {
+                                            val raw = prefs.getString("playlist_$name", "") ?: ""
+                                            val ids = raw.split("|").filter { it.isNotBlank() }.toSet() + song.id.toString()
+                                            prefs.edit().putString("playlist_$name", ids.joinToString("|")).apply()
+                                            if (name == selectedPlaylist) playlistSongs = ids
+                                        }
+                                        addToPlaylistSong = null
                                     },
                                     modifier = Modifier.fillMaxWidth()
                                 ) {
-                                    Text(albName, color = ElectricCyan)
+                                    Text(name, color = ElectricCyan)
                                 }
                             }
                         }
+                    },
+                    confirmButton = {},
+                    dismissButton = {
+                        TextButton(onClick = { addToPlaylistSong = null }) { Text("Cancel", color = MutedLavender) }
                     }
-                },
-                confirmButton = {},
-                dismissButton = {
-                    TextButton(onClick = { addToAlbumSong = null }) { Text("Cancel", color = MutedLavender) }
-                }
-            )
-        }
+                )
+            }
 
-        editTagSong?.let { song ->
-            TagEditorAndFingerprintDialog(
-                song = song,
-                onDismiss = { editTagSong = null },
-                onSave = { updatedTitle, updatedArtist, updatedAlbum, newArtUri ->
-                    val finalArt = newArtUri ?: song.albumArtUri
-                    saveMetadataOverride(prefs, song.id, updatedTitle, updatedArtist, updatedAlbum, finalArt)
-                    songs = songs.map {
-                        if (it.id == song.id) it.copy(
-                            title = updatedTitle,
-                            artist = updatedArtist,
-                            album = updatedAlbum,
-                            albumArtUri = finalArt
-                        ) else it
-                    }
-                    if (currentSong?.id == song.id) {
-                        currentSong = currentSong?.copy(
-                            title = updatedTitle,
-                            artist = updatedArtist,
-                            album = updatedAlbum,
-                            albumArtUri = finalArt
+            if (showCreateAlbum) {
+                AlertDialog(
+                    onDismissRequest = { showCreateAlbum = false },
+                    containerColor = NeoDialog,
+                    title = { Text("Create Custom Album", color = NeoInk) },
+                    text = {
+                        OutlinedTextField(
+                            value = newAlbumName,
+                            onValueChange = { newAlbumName = it },
+                            label = { Text("Album Name", color = MutedLavender) },
+                            singleLine = true,
+                            colors = OutlinedTextFieldDefaults.colors(
+                                focusedTextColor = NeoInk,
+                                unfocusedTextColor = NeoInk,
+                                focusedBorderColor = ElectricCyan
+                            )
                         )
+                    },
+                    confirmButton = {
+                        TextButton(onClick = {
+                            val name = newAlbumName.trim()
+                            if (name.isNotEmpty()) {
+                                customAlbums = (customAlbums + name).distinct().sorted()
+                                prefs.edit().putStringSet("custom_albums", customAlbums.toSet()).apply()
+                                prefs.edit().putString("album_$name", "").apply()
+                            }
+                            newAlbumName = ""
+                            showCreateAlbum = false
+                        }) { Text("Create", color = ElectricCyan) }
+                    },
+                    dismissButton = {
+                        TextButton(onClick = { showCreateAlbum = false }) { Text("Cancel", color = MutedLavender) }
                     }
-                    editTagSong = null
-                }
-            )
+                )
+            }
+
+            addToAlbumSong?.let { song ->
+                AlertDialog(
+                    onDismissRequest = { addToAlbumSong = null },
+                    containerColor = NeoDialog,
+                    title = { Text("Add Track to Album", color = NeoInk) },
+                    text = {
+                        if (customAlbums.isEmpty()) {
+                            Text("No custom albums created yet. Tap '+ Album' in the Albums tab to create one.", color = MutedLavender)
+                        } else {
+                            Column {
+                                for (albName in customAlbums) {
+                                    TextButton(
+                                        onClick = {
+                                            val raw = prefs.getString("album_$albName", "") ?: ""
+                                            val existing: Set<String> = raw.split("|").filter { it.isNotBlank() }.toSet()
+                                            val updated: Set<String> = existing + song.id.toString()
+                                            prefs.edit().putString("album_$albName", updated.joinToString("|")).apply()
+                                            addToAlbumSong = null
+                                        },
+                                        modifier = Modifier.fillMaxWidth()
+                                    ) {
+                                        Text(albName, color = ElectricCyan)
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    confirmButton = {},
+                    dismissButton = {
+                        TextButton(onClick = { addToAlbumSong = null }) { Text("Cancel", color = MutedLavender) }
+                    }
+                )
+            }
+
+            editTagSong?.let { song ->
+                TagEditorAndFingerprintDialog(
+                    song = song,
+                    onDismiss = { editTagSong = null },
+                    onSave = { updatedTitle, updatedArtist, updatedAlbum, newArtUri ->
+                        val finalArt = newArtUri ?: song.albumArtUri
+                        saveMetadataOverride(prefs, song.id, updatedTitle, updatedArtist, updatedAlbum, finalArt)
+                        markAutoFixed(prefs, song.id, add = false)
+                        songs = songs.map {
+                            if (it.id == song.id) it.copy(
+                                title = updatedTitle,
+                                artist = updatedArtist,
+                                album = updatedAlbum,
+                                albumArtUri = finalArt
+                            ) else it
+                        }
+                        if (currentSong?.id == song.id) {
+                            currentSong = currentSong?.copy(
+                                title = updatedTitle,
+                                artist = updatedArtist,
+                                album = updatedAlbum,
+                                albumArtUri = finalArt
+                            )
+                        }
+                        editTagSong = null
+                    }
+                )
+            }
         }
     }
 }
@@ -2313,7 +2751,7 @@ fun HomeScreen(
             .padding(vertical = 8.dp)
     ) {
         Surface(
-            color = GlassPill,
+            color = NeoSurface, shadowElevation = 6.dp,
             shape = RoundedCornerShape(24.dp),
             border = BorderStroke(1.2.dp, GlassBorder),
             modifier = Modifier.fillMaxWidth()
@@ -2341,7 +2779,7 @@ fun HomeScreen(
                     horizontalAlignment = Alignment.CenterHorizontally,
                     modifier = Modifier.clickable { onNavigateLibrary("Artists") }
                 ) {
-                    Text("${songs.map { it.artist }.distinct().size}", color = Color.White, fontSize = 22.sp, fontWeight = FontWeight.Black)
+                    Text("${songs.map { it.artist }.distinct().size}", color = NeoInk, fontSize = 22.sp, fontWeight = FontWeight.Black)
                     Text("Artists", color = MutedLavender, fontSize = 11.sp)
                 }
             }
@@ -2662,7 +3100,7 @@ fun PlaylistScreen(
     Column(modifier.verticalScroll(rememberScrollState()).padding(vertical = 8.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Column(Modifier.weight(1f)) {
-                Text("CUSTOM PLAYLISTS", color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.Bold)
+                Text("CUSTOM PLAYLISTS", color = NeoInk, fontSize = 20.sp, fontWeight = FontWeight.Bold)
                 Text("Organize collections & launch instant party queues", color = MutedLavender, fontSize = 11.sp)
             }
             Button(
@@ -2680,7 +3118,7 @@ fun PlaylistScreen(
             val matchedSongs = allSongs.filter { it.id.toString() in trackIds }
             BouncyButton(onClick = { onOpen(name) }, modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
                 Surface(
-                    color = GlassPill,
+                    color = NeoSurface, shadowElevation = 6.dp,
                     shape = RoundedCornerShape(20.dp),
                     border = BorderStroke(1.2.dp, if (name == selected) ElectricCyan else GlassBorder),
                     modifier = Modifier.fillMaxWidth()
@@ -2696,12 +3134,12 @@ fun PlaylistScreen(
                                     .background(Brush.linearGradient(listOf(NeonPurple.copy(alpha = 0.5f), ElectricCyan.copy(alpha = 0.5f)))),
                                 contentAlignment = Alignment.Center
                             ) {
-                                Icon(Icons.Default.QueueMusic, null, tint = Color.White)
+                                Icon(Icons.Default.QueueMusic, null, tint = NeoInk)
                             }
                         }
                         Spacer(Modifier.width(12.dp))
                         Column(Modifier.weight(1f)) {
-                            Text(name, color = Color.White, fontWeight = FontWeight.Bold, fontSize = 15.sp)
+                            Text(name, color = NeoInk, fontWeight = FontWeight.Bold, fontSize = 15.sp)
                             Text("${matchedSongs.size} tracks", color = MutedLavender, fontSize = 12.sp)
                         }
                         if (matchedSongs.isNotEmpty()) {
@@ -2711,7 +3149,7 @@ fun PlaylistScreen(
                         }
                         if (name != "Favorites") {
                             IconButton(onClick = { onDelete(name) }) {
-                                Icon(Icons.Default.DeleteOutline, contentDescription = "Delete", tint = Color(0xFFFF5286))
+                                Icon(Icons.Default.DeleteOutline, contentDescription = "Delete", tint = NeoDanger)
                             }
                         }
                     }
@@ -2739,10 +3177,10 @@ fun SettingsScreen(
     modifier: Modifier = Modifier
 ) {
     Column(modifier.verticalScroll(rememberScrollState()).padding(vertical = 10.dp)) {
-        Text("SETTINGS & AUDIO SUITE", color = Color.White, fontSize = 22.sp, fontWeight = FontWeight.Bold)
+        Text("SETTINGS & AUDIO SUITE", color = NeoInk, fontSize = 22.sp, fontWeight = FontWeight.Bold)
         Spacer(Modifier.height(14.dp))
         Surface(
-            color = GlassPill,
+            color = NeoSurface, shadowElevation = 6.dp,
             shape = RoundedCornerShape(20.dp),
             border = BorderStroke(1.2.dp, ElectricCyan.copy(alpha = 0.8f)),
             modifier = Modifier.fillMaxWidth()
@@ -2752,7 +3190,7 @@ fun SettingsScreen(
                     Icon(Icons.Default.Headphones, null, tint = ElectricCyan, modifier = Modifier.size(26.dp))
                     Spacer(Modifier.width(10.dp))
                     Column(Modifier.weight(1f)) {
-                        Text("Dual Audio Share (Party Mode)", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                        Text("Dual Audio Share (Party Mode)", color = NeoInk, fontWeight = FontWeight.Bold, fontSize = 14.sp)
                         Text("Stream synchronized audio to 2 Bluetooth headphones", color = MutedLavender, fontSize = 11.sp)
                     }
                 }
@@ -2773,7 +3211,7 @@ fun SettingsScreen(
         Spacer(Modifier.height(6.dp))
         outputs.forEach { output ->
             Surface(
-                color = GlassPill,
+                color = NeoSurface, shadowElevation = 6.dp,
                 shape = RoundedCornerShape(18.dp),
                 border = BorderStroke(1.2.dp, GlassBorder),
                 modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)
@@ -2791,7 +3229,7 @@ fun SettingsScreen(
                     )
                     Spacer(Modifier.width(12.dp))
                     Column {
-                        Text(output.kind.label, color = Color.White, fontWeight = FontWeight.SemiBold)
+                        Text(output.kind.label, color = NeoInk, fontWeight = FontWeight.SemiBold)
                         Text(output.name, color = MutedLavender, fontSize = 12.sp)
                     }
                 }
@@ -2819,9 +3257,8 @@ fun SettingsScreen(
                 onValueChange = onCustomTimerChange,
                 label = { Text("Custom min", color = MutedLavender) },
                 singleLine = true,
-                textStyle = TextStyle(color = Color.White, fontSize = 15.sp),
                 modifier = Modifier.width(130.dp),
-                colors = OutlinedTextFieldDefaults.colors(focusedTextColor = Color.White, unfocusedTextColor = Color.White)
+                colors = OutlinedTextFieldDefaults.colors(focusedTextColor = NeoInk, unfocusedTextColor = NeoInk)
             )
             Spacer(Modifier.width(8.dp))
             Button(
@@ -2836,7 +3273,7 @@ fun SettingsScreen(
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text("Remaining: %02d:%02d".format(timerLeft / 60, timerLeft % 60), color = ElectricCyan, fontWeight = FontWeight.Bold)
                 Spacer(Modifier.width(10.dp))
-                TextButton(onClick = onCancelTimer) { Text("Cancel", color = Color(0xFFFF5286)) }
+                TextButton(onClick = onCancelTimer) { Text("Cancel", color = NeoDanger) }
             }
         }
         Spacer(Modifier.height(16.dp))
@@ -2847,7 +3284,7 @@ fun SettingsScreen(
         Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             Button(
                 onClick = onRescan,
-                colors = ButtonDefaults.buttonColors(containerColor = GlassPill),
+                colors = ButtonDefaults.buttonColors(containerColor = NeoInset),
                 modifier = Modifier.weight(1f)
             ) {
                 Icon(Icons.Default.Refresh, null, tint = ElectricCyan, modifier = Modifier.size(16.dp))
@@ -2861,14 +3298,14 @@ fun SettingsScreen(
             ) {
                 Icon(Icons.Default.AutoFixHigh, null, tint = ElectricCyan, modifier = Modifier.size(16.dp))
                 Spacer(Modifier.width(6.dp))
-                Text("Auto-Fix All", color = Color.White, fontSize = 12.sp, maxLines = 1)
+                Text("Auto-Fix All", color = NeoInk, fontSize = 12.sp, maxLines = 1)
             }
         }
         Spacer(Modifier.height(8.dp))
         Button(
             onClick = onScanDuplicates,
             enabled = !isScanningDuplicates,
-            colors = ButtonDefaults.buttonColors(containerColor = GlassPill),
+            colors = ButtonDefaults.buttonColors(containerColor = NeoInset),
             modifier = Modifier.fillMaxWidth()
         ) {
             Icon(Icons.Default.CleaningServices, null, tint = ElectricCyan, modifier = Modifier.size(16.dp))

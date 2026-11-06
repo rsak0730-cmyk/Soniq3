@@ -46,7 +46,15 @@ object AudioFingerprintFixer {
     private const val MIN_TITLE_SIM = 0.72
     private const val MIN_ARTIST_SIM = 0.40
     private const val MAX_DURATION_DIFF_MS = 3000L
-    private const val MAX_DURATION_DIFF_NO_ARTIST_MS = 2000L
+    private const val MAX_DURATION_DIFF_NO_ARTIST_MS = 2500L
+    /** Without an artist tag the title must still agree closely (about 3 of 4 words). */
+    private const val MIN_TITLE_SIM_NO_ARTIST = 0.75
+    private val SEARCH_NOISE = setOf("official", "video", "full", "audio", "lyric", "lyrics", "song", "hd", "mp3", "feat", "ft")
+
+    /** Catalog requests that failed on the network during the last batch run. */
+    @Volatile var lastRunNetworkFailures: Int = 0
+        private set
+    private val networkFailures = AtomicInteger(0)
     private const val USER_AGENT = "Mozilla/5.0 (Android; Mobile) SONIQ/1.0"
 
     private val SPAM_PATTERNS = listOf(
@@ -160,11 +168,14 @@ object AudioFingerprintFixer {
     private fun buildQueries(localTitle: String, localArtist: String): List<String> {
         val queries = LinkedHashSet<String>()
         if (localArtist.isNotBlank()) queries.add("$localTitle $localArtist")
+        // Without "Official / Video / Full" the catalog finds the song far more often.
+        val core = localTitle.split(" ").filter { it.isNotBlank() && it.lowercase() !in SEARCH_NOISE }.joinToString(" ")
+        if (core.length >= 3) queries.add(core)
         queries.add(localTitle)
         val words = localTitle.split(" ").filter { it.isNotBlank() }
         if (words.size >= 3) queries.add(words.take(3).joinToString(" "))
         if (words.size >= 2) queries.add(words.take(2).joinToString(" "))
-        return queries.filter { it.length >= 3 }.take(4)
+        return queries.filter { it.length >= 3 }.take(5)
     }
 
     /** Returns a 0..1 score when the candidate agrees with the file, or null when it does not. */
@@ -180,7 +191,7 @@ object AudioFingerprintFixer {
         if (hasDur && diff > MAX_DURATION_DIFF_MS) return null
         if (localArtist.isBlank()) {
             // Without an artist, only a tight title + length match is trusted.
-            if (!hasDur || diff > MAX_DURATION_DIFF_NO_ARTIST_MS || titleSim < 0.85) return null
+            if (!hasDur || diff > MAX_DURATION_DIFF_NO_ARTIST_MS || titleSim < MIN_TITLE_SIM_NO_ARTIST) return null
         }
         val durScore = if (hasDur) 1.0 - diff.toDouble() / MAX_DURATION_DIFF_MS else 0.5
         return 0.55 * titleSim + 0.25 * artistSim + 0.20 * durScore
@@ -244,6 +255,7 @@ object AudioFingerprintFixer {
                 }
                 if (conn.responseCode != 200) {
                     conn.disconnect()
+                    networkFailures.incrementAndGet()
                     continue
                 }
                 val text = conn.inputStream.bufferedReader().use { it.readText() }
@@ -278,6 +290,7 @@ object AudioFingerprintFixer {
                     )
                 }
             } catch (_: Exception) {
+                networkFailures.incrementAndGet()
                 continue
             }
         }
@@ -297,6 +310,7 @@ object AudioFingerprintFixer {
             }
             if (conn.responseCode != 200) {
                 conn.disconnect()
+                networkFailures.incrementAndGet()
                 return emptyList()
             }
             val text = conn.inputStream.bufferedReader().use { it.readText() }
@@ -315,6 +329,7 @@ object AudioFingerprintFixer {
                 )
             }
         } catch (_: Exception) {
+            networkFailures.incrementAndGet()
             emptyList()
         }
     }
@@ -374,6 +389,7 @@ object AudioFingerprintFixer {
     ): Int = withContext(Dispatchers.IO) {
         val total = songs.size
         if (total == 0) return@withContext 0
+        networkFailures.set(0)
 
         val fixedCount = AtomicInteger(0)
         val done = AtomicInteger(0)
@@ -385,7 +401,8 @@ object AudioFingerprintFixer {
                     semaphore.withPermit {
                         try {
                             val result = autoFixSong(context, song)
-                            if (result.matchConfidence >= 0.50f) {
+                            // Only a verified match counts. The cleaned-title fallback (0.55) is not a fix.
+                            if (result.matchConfidence >= 0.60f) {
                                 withContext(Dispatchers.Main) { onSongFixed(song, result) }
                                 fixedCount.incrementAndGet()
                             } else {
@@ -400,6 +417,7 @@ object AudioFingerprintFixer {
                 }
             }.awaitAll()
         }
+        lastRunNetworkFailures = networkFailures.get()
         fixedCount.get()
     }
 }

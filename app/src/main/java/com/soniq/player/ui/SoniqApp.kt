@@ -1886,8 +1886,9 @@ fun SoniqApp() {
         if (forward) {
             when {
                 c.hasNextMediaItem() -> c.seekToNextMediaItem()
-                c.repeatMode == Player.REPEAT_MODE_ALL -> c.seekToDefaultPosition(0)
-                else -> return
+                // Wrap to the first item when the playlist reaches its end,
+                // even when Repeat All is disabled.
+                else -> c.seekToDefaultPosition(0)
             }
         } else {
             // Like most players: a previous tap in the first 3 seconds goes to the previous track.
